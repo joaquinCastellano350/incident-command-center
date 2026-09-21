@@ -3,45 +3,47 @@ import { randomUUID } from 'node:crypto';
 import { buildApi } from '../../apps/api/src/app.js';
 import {
   HEALTH_CHECK_QUEUE,
-  PgBossHealthJobWorker,
-  PostgresHealthSystem,
+  createPostgresHealthJobWorker,
+  createPostgresHealthSystem,
 } from '@incident-command-center/adapters';
 import {
   HealthCheckJobSchema,
   HealthStatusSchema,
 } from '@incident-command-center/contracts';
 import { ManualClock } from '@incident-command-center/testing';
-import { PgBoss } from 'pg-boss';
-import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const describeWithPostgres = databaseUrl ? describe : describe.skip;
 
 describeWithPostgres('health job round trip', () => {
-  const clock = new ManualClock('2026-09-21T12:00:00.000Z');
+  const apiClock = new ManualClock('2026-09-21T12:00:00.000Z');
+  const workerClock = new ManualClock('2026-09-21T12:00:05.000Z');
   const correlationId = randomUUID();
-  let pool: Pool;
-  let apiBoss: PgBoss;
-  let workerBoss: PgBoss;
-  let healthSystem: PostgresHealthSystem;
-  let worker: PgBossHealthJobWorker;
+  const queueName = `${HEALTH_CHECK_QUEUE}-${randomUUID()}`;
+  let healthSystem: ReturnType<typeof createPostgresHealthSystem>;
+  let worker: ReturnType<typeof createPostgresHealthJobWorker>;
   let api: Awaited<ReturnType<typeof buildApi>>;
 
   beforeAll(async () => {
-    pool = new Pool({ connectionString: databaseUrl });
-    apiBoss = new PgBoss({ connectionString: databaseUrl! });
-    workerBoss = new PgBoss({ connectionString: databaseUrl! });
-    healthSystem = new PostgresHealthSystem(pool, apiBoss, clock);
+    healthSystem = createPostgresHealthSystem({
+      connectionString: databaseUrl!,
+      clock: apiClock,
+      queueName,
+    });
     await healthSystem.start();
 
-    worker = new PgBossHealthJobWorker(pool, workerBoss, clock);
+    worker = createPostgresHealthJobWorker({
+      connectionString: databaseUrl!,
+      clock: workerClock,
+      queueName,
+    });
     await worker.start();
 
     api = await buildApi({
       healthSystem,
-      clock,
       allowedOrigin: 'http://localhost:3000',
+      logger: false,
     });
   });
 
@@ -49,7 +51,6 @@ describeWithPostgres('health job round trip', () => {
     await api?.close();
     await worker?.stop();
     await healthSystem?.stop();
-    await pool?.end();
   });
 
   it('persists a submitted job, lets the worker complete it, and exposes the result', async () => {
@@ -84,8 +85,6 @@ describeWithPostgres('health job round trip', () => {
       result: null,
     });
 
-    clock.set('2026-09-21T12:00:05.000Z');
-
     await expect
       .poll(
         async () => {
@@ -105,7 +104,7 @@ describeWithPostgres('health job round trip', () => {
         completedAt: '2026-09-21T12:00:05.000Z',
         result: {
           message: 'Durable health check completed',
-          queue: HEALTH_CHECK_QUEUE,
+          queue: queueName,
         },
       });
   });

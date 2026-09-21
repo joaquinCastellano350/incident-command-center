@@ -16,6 +16,7 @@ services:
       - postgres-data:/var/lib/postgresql/data
 
   api:
+    image: incident-command-center:local
     build:
       context: .
       dockerfile: Dockerfile
@@ -33,6 +34,7 @@ services:
         condition: service_healthy
 
   worker:
+    image: incident-command-center:local
     build:
       context: .
       dockerfile: Dockerfile
@@ -45,6 +47,7 @@ services:
         condition: service_healthy
 
   web:
+    image: incident-command-center:local
     build:
       context: .
       dockerfile: Dockerfile

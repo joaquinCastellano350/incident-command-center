@@ -11,8 +11,6 @@
   "dependencies": {
     "@incident-command-center/adapters": "*",
     "@incident-command-center/domain": "*",
-    "pg": "8.23.0",
-    "pg-boss": "12.33.3",
     "zod": "4.6.5"
   }
 }

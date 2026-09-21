@@ -6,14 +6,13 @@ import {
   HealthCheckJobSchema,
   HealthStatusSchema,
 } from '@incident-command-center/contracts';
-import type { Clock } from '@incident-command-center/domain';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
 interface BuildApiDependencies {
   healthSystem: HealthSystem;
-  clock: Clock;
   allowedOrigin: string;
+  logger?: boolean;
 }
 
 const JobParametersSchema = z.object({ id: z.uuid() });
@@ -21,8 +20,12 @@ const JobParametersSchema = z.object({ id: z.uuid() });
 export async function buildApi({
   healthSystem,
   allowedOrigin,
+  logger = true,
 }: BuildApiDependencies): Promise<FastifyInstance> {
-  const app = Fastify({ logger: false });
+  const app = Fastify({
+    logger,
+    requestIdHeader: 'x-correlation-id',
+  });
 
   await app.register(cors, {
     origin: allowedOrigin,
@@ -48,6 +51,10 @@ export async function buildApi({
       : randomUUID();
     const job = HealthCheckJobSchema.parse(
       await healthSystem.submitHealthCheck(correlationId),
+    );
+    request.log.info(
+      { healthJobId: job.id, correlationId },
+      'health job queued',
     );
     return reply
       .header('location', `/api/v1/health-jobs/${job.id}`)

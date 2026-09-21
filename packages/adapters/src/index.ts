@@ -1,22 +1,24 @@
 import { randomUUID } from 'node:crypto';
 
-import type { HealthSystem } from '@incident-command-center/application';
+import type {
+  HealthJobQueue,
+  HealthSystem,
+  TransactionalDatabase,
+} from '@incident-command-center/application';
 import {
   HealthCheckJobSchema,
+  HealthCheckMessageV1Schema,
   type HealthCheckJob,
+  type HealthCheckMessageV1,
   type HealthStatus,
 } from '@incident-command-center/contracts';
 import type { Clock } from '@incident-command-center/domain';
 import type { Pool, PoolClient } from 'pg';
-import { PgBoss, type Db, type Job } from 'pg-boss';
+import { Pool as PostgresPool } from 'pg';
+import { PgBoss, type Db } from 'pg-boss';
 
 export const HEALTH_CHECK_QUEUE = 'system-health-check';
-const WORKER_NAME = 'health-worker';
 const WORKER_READY_WINDOW_MS = 15_000;
-
-interface HealthJobPayload {
-  healthJobId: string;
-}
 
 interface HealthJobRow {
   id: string;
@@ -47,12 +49,77 @@ export async function ensureApplicationSchema(pool: Pool): Promise<void> {
   await pool.query(schemaSql);
 }
 
-function clientDatabase(client: PoolClient): Db {
+function clientDatabase(client: PoolClient): TransactionalDatabase {
   return {
     async executeSql(text, values = []) {
       return client.query(text, values);
     },
   };
+}
+
+class PgBossHealthJobQueue implements HealthJobQueue {
+  readonly #boss: PgBoss;
+
+  constructor(
+    connectionString: string,
+    readonly name: string,
+  ) {
+    this.#boss = new PgBoss({ connectionString });
+  }
+
+  async start(): Promise<void> {
+    this.#boss.on('error', (error) => {
+      console.error('pg-boss error', error);
+    });
+    await this.#boss.start();
+    await this.#boss.createQueue(this.name, { notify: true });
+  }
+
+  async stop(): Promise<void> {
+    await this.#boss.stop({ graceful: true, timeout: 10_000 });
+  }
+
+  async enqueue(
+    message: HealthCheckMessageV1,
+    options: { id: string; transaction: TransactionalDatabase },
+  ): Promise<void> {
+    await this.#boss.send(
+      this.name,
+      HealthCheckMessageV1Schema.parse(message),
+      {
+        id: options.id,
+        db: options.transaction as Db,
+        retryLimit: 3,
+        retryDelay: 1,
+        retryBackoff: true,
+        deleteAfterSeconds: 0,
+      },
+    );
+  }
+
+  async process(
+    handler: (
+      message: HealthCheckMessageV1,
+      transaction: TransactionalDatabase,
+    ) => Promise<void>,
+  ): Promise<void> {
+    await this.#boss.work(
+      this.name,
+      {
+        transactional: true,
+        pollingIntervalSeconds: 0.5,
+      },
+      async (jobs, transaction) => {
+        const job = jobs[0];
+        if (job) {
+          await handler(
+            HealthCheckMessageV1Schema.parse(job.data),
+            transaction,
+          );
+        }
+      },
+    );
+  }
 }
 
 function mapHealthJob(row: HealthJobRow): HealthCheckJob {
@@ -69,21 +136,18 @@ function mapHealthJob(row: HealthJobRow): HealthCheckJob {
 export class PostgresHealthSystem implements HealthSystem {
   constructor(
     private readonly pool: Pool,
-    private readonly boss: PgBoss,
+    private readonly queue: HealthJobQueue,
     private readonly clock: Clock,
   ) {}
 
   async start(): Promise<void> {
     await ensureApplicationSchema(this.pool);
-    this.boss.on('error', (error) => {
-      console.error('pg-boss error', error);
-    });
-    await this.boss.start();
-    await this.boss.createQueue(HEALTH_CHECK_QUEUE, { notify: true });
+    await this.queue.start();
   }
 
   async stop(): Promise<void> {
-    await this.boss.stop({ graceful: true, timeout: 10_000 });
+    await this.queue.stop();
+    await this.pool.end();
   }
 
   async readiness(): Promise<HealthStatus> {
@@ -95,7 +159,7 @@ export class PostgresHealthSystem implements HealthSystem {
         `SELECT observed_at
          FROM worker_heartbeats
          WHERE worker_name = $1`,
-        [WORKER_NAME],
+        [this.queue.name],
       );
       const observedAt = heartbeat.rows[0]?.observed_at;
       const workerReady =
@@ -135,17 +199,13 @@ export class PostgresHealthSystem implements HealthSystem {
         [id, correlationId, requestedAt],
       );
 
-      await this.boss.send(
-        HEALTH_CHECK_QUEUE,
-        { healthJobId: id } satisfies HealthJobPayload,
+      await this.queue.enqueue(
         {
-          id,
-          db: clientDatabase(client),
-          retryLimit: 3,
-          retryDelay: 1,
-          retryBackoff: true,
-          deleteAfterSeconds: 86_400,
+          version: 1,
+          healthJobId: id,
+          correlationId,
         },
+        { id, transaction: clientDatabase(client) },
       );
       await client.query('COMMIT');
 
@@ -173,17 +233,13 @@ export class PgBossHealthJobWorker {
 
   constructor(
     private readonly pool: Pool,
-    private readonly boss: PgBoss,
+    private readonly queue: HealthJobQueue,
     private readonly clock: Clock,
   ) {}
 
   async start(): Promise<void> {
     await ensureApplicationSchema(this.pool);
-    this.boss.on('error', (error) => {
-      console.error('pg-boss worker error', error);
-    });
-    await this.boss.start();
-    await this.boss.createQueue(HEALTH_CHECK_QUEUE, { notify: true });
+    await this.queue.start();
     await this.recordHeartbeat();
 
     this.#heartbeatTimer = setInterval(() => {
@@ -191,46 +247,43 @@ export class PgBossHealthJobWorker {
     }, 5_000);
     this.#heartbeatTimer.unref();
 
-    await this.boss.work(
-      HEALTH_CHECK_QUEUE,
-      {
-        transactional: true,
-        pollingIntervalSeconds: 0.5,
-      },
-      async (jobs: Job<HealthJobPayload>[], transaction: Db) => {
-        await this.complete(jobs, transaction);
-      },
-    );
+    await this.queue.process(async (message, transaction) => {
+      await this.complete(message, transaction);
+    });
   }
 
   async stop(): Promise<void> {
     if (this.#heartbeatTimer) {
       clearInterval(this.#heartbeatTimer);
     }
-    await this.boss.stop({ graceful: true, timeout: 10_000 });
+    await this.queue.stop();
+    await this.pool.end();
   }
 
   private async complete(
-    jobs: Job<HealthJobPayload>[],
-    transaction: Db,
+    message: HealthCheckMessageV1,
+    transaction: TransactionalDatabase,
   ): Promise<void> {
-    const job = jobs[0];
-    if (!job) {
-      return;
-    }
-
     await transaction.executeSql(
       `UPDATE health_check_jobs
        SET status = 'completed', completed_at = $2, result = $3::jsonb
        WHERE id = $1`,
       [
-        job.data.healthJobId,
+        message.healthJobId,
         this.clock.now(),
         JSON.stringify({
           message: 'Durable health check completed',
-          queue: HEALTH_CHECK_QUEUE,
+          queue: this.queue.name,
         }),
       ],
+    );
+
+    console.info(
+      JSON.stringify({
+        event: 'health_job.completed',
+        healthJobId: message.healthJobId,
+        correlationId: message.correlationId,
+      }),
     );
   }
 
@@ -240,7 +293,33 @@ export class PgBossHealthJobWorker {
        VALUES ($1, $2)
        ON CONFLICT (worker_name)
        DO UPDATE SET observed_at = EXCLUDED.observed_at`,
-      [WORKER_NAME, this.clock.now()],
+      [this.queue.name, this.clock.now()],
     );
   }
+}
+
+interface HealthRuntimeOptions {
+  connectionString: string;
+  clock: Clock;
+  queueName?: string;
+}
+
+export function createPostgresHealthSystem({
+  connectionString,
+  clock,
+  queueName = HEALTH_CHECK_QUEUE,
+}: HealthRuntimeOptions): PostgresHealthSystem {
+  const pool = new PostgresPool({ connectionString });
+  const queue = new PgBossHealthJobQueue(connectionString, queueName);
+  return new PostgresHealthSystem(pool, queue, clock);
+}
+
+export function createPostgresHealthJobWorker({
+  connectionString,
+  clock,
+  queueName = HEALTH_CHECK_QUEUE,
+}: HealthRuntimeOptions): PgBossHealthJobWorker {
+  const pool = new PostgresPool({ connectionString });
+  const queue = new PgBossHealthJobQueue(connectionString, queueName);
+  return new PgBossHealthJobWorker(pool, queue, clock);
 }

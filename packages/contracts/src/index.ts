@@ -27,3 +27,11 @@ export const HealthCheckJobSchema = z.object({
 });
 
 export type HealthCheckJob = z.infer<typeof HealthCheckJobSchema>;
+
+export const HealthCheckMessageV1Schema = z.object({
+  version: z.literal(1),
+  healthJobId: z.uuid(),
+  correlationId: z.uuid(),
+});
+
+export type HealthCheckMessageV1 = z.infer<typeof HealthCheckMessageV1Schema>;
