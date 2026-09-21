@@ -1,0 +1,3 @@
+# Use at-least-once delivery with idempotent effects
+
+The system will assume that asynchronous messages may be delivered more than once and will make observable effects idempotent rather than claiming exactly-once delivery. Stable source deduplication keys, one Triage Case per Signal, versioned Policy Decision identities, Workflow Action idempotency keys, and a transactional outbox will allow retries and replay without creating duplicate operational work. Every Workflow Action keeps an append-only Action Attempt history while its current status advances through pending, executing, retry scheduled, succeeded, or permanently failed. Permanent failure creates an urgent operator notification and never rolls back an earlier successful effect.

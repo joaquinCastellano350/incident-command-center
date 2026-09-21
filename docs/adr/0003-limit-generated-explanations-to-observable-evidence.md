@@ -1,0 +1,3 @@
+# Limit generated explanations to observable evidence
+
+The generative assistant may summarize cited source evidence, restate observable Operational Judgments, and explain the explicit Policy Decision path, but it must not claim to reveal Jev's internal reasoning. The product will distinguish source evidence, model judgment, policy rule, and generated interpretation so a plausible narrative cannot be mistaken for a model-provided rationale. Assistant output will structure factual claims with stable Signal or Timeline Event identifiers and hypotheses in a distinct field; the application validates that every citation exists in the allowlisted input and rejects or regenerates invalid output.

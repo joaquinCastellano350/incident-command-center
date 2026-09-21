@@ -1,0 +1,17 @@
+{
+  "name": "@incident-command-center/adapters",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@incident-command-center/application": "*",
+    "@incident-command-center/contracts": "*",
+    "@incident-command-center/domain": "*",
+    "pg": "8.23.0",
+    "pg-boss": "12.33.3"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@incident-command-center/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@fastify/cors": "11.3.0",
+    "@incident-command-center/adapters": "*",
+    "@incident-command-center/application": "*",
+    "@incident-command-center/contracts": "*",
+    "@incident-command-center/domain": "*",
+    "fastify": "5.12.5",
+    "pg": "8.23.0",
+    "pg-boss": "12.33.3",
+    "zod": "4.6.5"
+  }
+}

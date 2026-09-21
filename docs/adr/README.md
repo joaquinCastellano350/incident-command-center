@@ -1,0 +1,27 @@
+# Architecture Decision Records
+
+These records explain durable or non-obvious choices behind the authoritative [project specification](../../PROJECT.md).
+
+1. [Separate semantic judgment from action authority](./0001-separate-judgment-from-action-authority.md)
+2. [Gate automation by action-specific risk](./0002-gate-automation-by-action-specific-risk.md)
+3. [Limit generated explanations to observable evidence](./0003-limit-generated-explanations-to-observable-evidence.md)
+4. [Use real decision services behind simulated provider boundaries](./0004-use-real-decision-services-behind-simulated-provider-boundaries.md)
+5. [Retrieve candidates before judging incident matches](./0005-retrieve-candidates-before-judging-incident-matches.md)
+6. [Preserve automated decisions when humans override](./0006-preserve-automated-decisions-when-humans-override.md)
+7. [Do not substitute models after a Jev failure](./0007-do-not-substitute-models-after-jev-failure.md)
+8. [Keep Incident lifecycle transitions human-controlled](./0008-keep-incident-lifecycle-transitions-human-controlled.md)
+9. [Use at-least-once delivery with idempotent effects](./0009-use-at-least-once-delivery-with-idempotent-effects.md)
+10. [Minimize and isolate model data access](./0010-minimize-and-isolate-model-data-access.md)
+11. [Decompose operational impact into independent judgments](./0011-decompose-operational-impact-into-independent-judgments.md)
+12. [Select automation thresholds from error budgets](./0012-select-automation-thresholds-from-error-budgets.md)
+13. [Version Evaluations and preserve Re-evaluations](./0013-version-evaluations-and-preserve-re-evaluations.md)
+14. [Build a modular monolith with background workers](./0014-build-a-modular-monolith-with-background-workers.md)
+15. [Use an end-to-end TypeScript monorepo](./0015-use-an-end-to-end-typescript-monorepo.md)
+16. [Use PostgreSQL for state and durable jobs](./0016-use-postgresql-for-state-and-durable-jobs.md)
+17. [Support local and controlled public demos](./0017-support-local-and-controlled-public-demos.md)
+18. [Make decision observability part of the product](./0018-make-decision-observability-part-of-the-product.md)
+19. [Use relational current state with append-only history](./0019-use-relational-current-state-with-append-only-history.md)
+20. [Use deterministic retrieval before Incident Match judgments](./0020-use-deterministic-retrieval-before-incident-match-judgments.md)
+21. [Use REST commands and Server-Sent Events](./0021-use-rest-commands-and-server-sent-events.md)
+22. [Keep generated assistant content out of Incident truth](./0022-keep-generated-assistant-content-out-of-incident-truth.md)
+23. [Run demo scenarios through provider adapters](./0023-run-demo-scenarios-through-provider-adapters.md)

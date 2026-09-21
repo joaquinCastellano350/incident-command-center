@@ -1,0 +1,3 @@
+# Version evaluations and preserve re-evaluations
+
+Every Evaluation will record its normalization, decision-schema, question-set, resolved model, and policy versions so its result can be reproduced and interpreted after the system changes. It also records an internal attempt identifier, provider request identifier, token usage, local wall-clock latency, retry count, and normalized terminal outcome. Evaluation and deployed profiles will pin explicit model versions; aliases such as `latest` are permitted only in an opt-in development profile. Application-level deadlines bound SDK retries. Changing evidence or a version never rewrites an old result: an explicit Re-evaluation appends a linked Evaluation and may produce a new Policy Decision without erasing prior actions.

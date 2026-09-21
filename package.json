@@ -1,0 +1,42 @@
+{
+  "name": "incident-command-center",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "workspaces": [
+    "packages/contracts",
+    "packages/domain",
+    "packages/application",
+    "packages/adapters",
+    "packages/testing",
+    "apps/api",
+    "apps/worker",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "docker compose up --build",
+    "dev:down": "docker compose down",
+    "dev:reset": "docker compose down --volumes",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "postgres:up": "docker compose up -d --wait postgres",
+    "test": "npm run postgres:up && cross-env TEST_DATABASE_URL=postgres://incident:incident@localhost:5432/incident_command_center vitest run",
+    "test:integration": "cross-env TEST_DATABASE_URL=postgres://incident:incident@localhost:5432/incident_command_center vitest run tests/integration",
+    "quality": "npm run format:check && npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2",
+    "@types/pg": "8.23.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "cross-env": "10.1.0",
+    "prettier": "3.9.8",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.1"
+  }
+}
