@@ -24,6 +24,20 @@ export interface PagingProviderPort<TPage = unknown> {
   page(page: TPage): Promise<{ providerReference: string }>;
 }
 
+export interface AssignmentProviderPort<TAssignment = unknown> {
+  assign(assignment: TAssignment): Promise<{ providerReference: string }>;
+}
+
+export class WorkflowProviderError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+    readonly providerReference: string | null = null,
+  ) {
+    super(message);
+  }
+}
+
 export interface OperationalJudgmentResult<TJudgments> {
   judgments: TJudgments;
   incidentMatches: Array<{

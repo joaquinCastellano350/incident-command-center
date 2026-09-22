@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import type {
   HealthJobQueue,
@@ -9,6 +9,8 @@ import type {
 } from '@incident-command-center/application';
 import {
   DeploymentEventIngestionResultSchema,
+  ActionAttemptSchema,
+  AssignmentRequestSchema,
   CorroboratingFactSchema,
   EvaluationSchema,
   ReviewTaskSchema,
@@ -25,6 +27,9 @@ import {
   TriageJobMessageV1Schema,
   TimelineEventSchema,
   WorkflowActionSchema,
+  WorkflowActionDefinitionSchema,
+  WorkflowActionJobMessageV1Schema,
+  type AssignmentRequest,
   type HealthCheckJob,
   type HealthCheckMessageV1,
   type HealthStatus,
@@ -46,12 +51,16 @@ import {
   type TriageJobMessageV1,
   type TimelineEvent,
   type WorkflowAction,
+  type WorkflowActionDefinition,
+  type WorkflowActionJobMessageV1,
 } from '@incident-command-center/contracts';
 import {
   decideAutomation,
   evaluateDeploymentEventDeterministically,
   evaluateMonitoringAlertDeterministically,
   NORTHSTAR_SERVICE_DOMAINS,
+  WorkflowProviderError,
+  type AssignmentProviderPort,
   type Clock,
   type OperationalJudgmentProviderPort,
   type OperationalJudgmentResult,
@@ -76,6 +85,14 @@ export const TRIAGE_QUEUE = 'triage-case-processing';
 const WORKER_READY_WINDOW_MS = 15_000;
 const APPLICATION_SCHEMA_LOCK = 740_219_350;
 const TRIAGE_MATCH_LOCK = 740_219_351;
+
+function workflowActionId(key: string): string {
+  const bytes = createHash('sha1').update(key).digest().subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 interface HealthJobRow {
   id: string;
@@ -225,6 +242,83 @@ const schemaSql = `
     record jsonb NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS action_attempts (
+    id uuid PRIMARY KEY,
+    action_id uuid NOT NULL REFERENCES workflow_actions(id),
+    sequence integer NOT NULL,
+    record jsonb NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS action_attempts_action_sequence
+    ON action_attempts (action_id, sequence);
+
+  CREATE TABLE IF NOT EXISTS effects_ledger (
+    idempotency_key text PRIMARY KEY,
+    action_id uuid NOT NULL UNIQUE REFERENCES workflow_actions(id),
+    status text NOT NULL CHECK (status IN
+      ('pending', 'executing', 'retry_scheduled', 'succeeded', 'permanently_failed')),
+    provider_reference text,
+    next_retry_at timestamptz,
+    suppressed_count integer NOT NULL DEFAULT 0,
+    failure_reason text,
+    claimed_at timestamptz,
+    claim_token uuid
+  );
+
+  ALTER TABLE effects_ledger ADD COLUMN IF NOT EXISTS next_retry_at timestamptz;
+  ALTER TABLE effects_ledger ADD COLUMN IF NOT EXISTS suppressed_count integer NOT NULL DEFAULT 0;
+  ALTER TABLE effects_ledger ADD COLUMN IF NOT EXISTS failure_reason text;
+
+  INSERT INTO effects_ledger (idempotency_key, action_id, status,
+    provider_reference, next_retry_at, suppressed_count, failure_reason)
+  SELECT w.idempotency_key, w.id, w.record->>'status',
+    w.record->>'providerReference',
+    (w.record->>'nextRetryAt')::timestamptz,
+    COALESCE((w.record->>'suppressedCount')::integer, 0),
+    w.record->>'failureReason'
+  FROM workflow_actions w
+  WHERE w.record ? 'status'
+  ON CONFLICT (idempotency_key) DO NOTHING;
+
+  UPDATE effects_ledger l SET
+    next_retry_at = (w.record->>'nextRetryAt')::timestamptz,
+    suppressed_count = COALESCE((w.record->>'suppressedCount')::integer, 0),
+    failure_reason = w.record->>'failureReason'
+  FROM workflow_actions w
+  WHERE l.action_id = w.id AND w.record ? 'status';
+
+  INSERT INTO action_attempts (id, action_id, sequence, record)
+  SELECT (attempt.value->>'id')::uuid, w.id, attempt.ordinality::integer,
+    jsonb_build_object(
+      'id', attempt.value->>'id',
+      'sequence', attempt.ordinality,
+      'attemptedAt', attempt.value->>'attemptedAt',
+      'outcome', attempt.value->>'outcome',
+      'providerReference', attempt.value->'providerReference',
+      'detail', NULL
+    )
+  FROM workflow_actions w,
+    LATERAL jsonb_array_elements(COALESCE(w.record->'attempts', '[]'::jsonb))
+      WITH ORDINALITY AS attempt(value, ordinality)
+  WHERE w.record ? 'status'
+  ON CONFLICT (id) DO NOTHING;
+
+  UPDATE workflow_actions w SET record = jsonb_build_object(
+    'id', w.id,
+    'correlationId', w.record->>'correlationId',
+    'policyDecisionId', COALESCE(w.record->>'policyDecisionId',
+      (SELECT p.id::text FROM policy_decisions p
+       WHERE p.triage_case_id = w.triage_case_id
+       ORDER BY p.record->>'decidedAt' DESC LIMIT 1)),
+    'type', w.record->>'type',
+    'targetOwningDomain', COALESCE(w.record->'targetOwningDomain',
+      CASE WHEN w.record->>'type' = 'create_incident' THEN 'null'::jsonb
+      ELSE (SELECT i.record->'primaryOwningDomain' FROM incidents i
+            WHERE i.id = w.incident_id) END),
+    'idempotencyKey', w.idempotency_key,
+    'maxAttempts', COALESCE((w.record->>'maxAttempts')::integer, 3)
+  ) WHERE w.record ? 'status';
+
   CREATE TABLE IF NOT EXISTS timeline_events (
     id uuid PRIMARY KEY,
     incident_id uuid NOT NULL REFERENCES incidents(id),
@@ -289,7 +383,11 @@ class PgBossJobQueue<TMessage extends object> {
 
   async enqueue(
     message: TMessage,
-    options: { id: string; transaction: TransactionalDatabase },
+    options: {
+      id: string;
+      transaction: TransactionalDatabase;
+      startAfter?: string;
+    },
   ): Promise<void> {
     await this.#boss.send(this.name, this.messageSchema.parse(message), {
       id: options.id,
@@ -298,6 +396,7 @@ class PgBossJobQueue<TMessage extends object> {
       retryDelay: 1,
       retryBackoff: true,
       deleteAfterSeconds: 0,
+      ...(options.startAfter ? { startAfter: options.startAfter } : {}),
     });
   }
 
@@ -366,6 +465,54 @@ function mapTriageCase(row: TriageCaseRow): TriageCase {
     receivedAt: row.received_at.toISOString(),
     correlationId: row.correlation_id,
   });
+}
+
+interface WorkflowActionStateRow {
+  record: WorkflowActionDefinition;
+  status: WorkflowAction['status'];
+  provider_reference: string | null;
+  next_retry_at: Date | null;
+  suppressed_count: number;
+  failure_reason: string | null;
+}
+
+function mapWorkflowAction(
+  row: WorkflowActionStateRow,
+  attempts: unknown = [],
+): WorkflowAction {
+  return WorkflowActionSchema.parse({
+    ...row.record,
+    status: row.status,
+    providerReference: row.provider_reference,
+    nextRetryAt: row.next_retry_at?.toISOString() ?? null,
+    suppressedCount: row.suppressed_count,
+    failureReason: row.failure_reason,
+    attempts,
+  });
+}
+
+async function loadWorkflowActions(
+  pool: Pool,
+  column: 'triage_case_id' | 'incident_id',
+  id: string,
+): Promise<WorkflowAction[]> {
+  const result = await pool.query<
+    WorkflowActionStateRow & { attempts: unknown }
+  >(
+    `SELECT w.record, l.status, l.provider_reference, l.next_retry_at,
+       l.suppressed_count, l.failure_reason,
+       COALESCE(jsonb_agg(a.record ORDER BY a.sequence, a.record->>'attemptedAt')
+         FILTER (WHERE a.id IS NOT NULL), '[]'::jsonb) AS attempts
+     FROM workflow_actions w
+     JOIN effects_ledger l ON l.action_id = w.id
+     LEFT JOIN action_attempts a ON a.action_id = w.id
+     WHERE w.${column} = $1
+     GROUP BY w.id, l.idempotency_key
+     ORDER BY CASE w.record->>'type'
+       WHEN 'create_incident' THEN 1 WHEN 'assign_owner' THEN 2 ELSE 3 END`,
+    [id],
+  );
+  return result.rows.map((row) => mapWorkflowAction(row, row.attempts));
 }
 
 export class PostgresHealthSystem implements HealthSystem {
@@ -537,17 +684,44 @@ export class PostgresTriageSystem implements TriageSystem {
   constructor(
     private readonly pool: Pool,
     private readonly queue: TriageJobQueue,
+    private readonly actionQueue: PgBossJobQueue<WorkflowActionJobMessageV1>,
     private readonly clock: Clock,
   ) {}
 
   async start(): Promise<void> {
     await ensureApplicationSchema(this.pool);
     await this.queue.start();
+    await this.actionQueue.start();
   }
 
   async stop(): Promise<void> {
+    await this.actionQueue.stop();
     await this.queue.stop();
     await this.pool.end();
+  }
+
+  async replayWorkflowAction(actionId: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<{ record: WorkflowActionDefinition }>(
+        'SELECT record FROM workflow_actions WHERE id = $1',
+        [actionId],
+      );
+      const action = WorkflowActionDefinitionSchema.parse(
+        result.rows[0]?.record,
+      );
+      await this.actionQueue.enqueue(
+        { version: 1, actionId, correlationId: action.correlationId },
+        { id: randomUUID(), transaction: clientDatabase(client) },
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async ingestMonitoringAlert(
@@ -762,12 +936,7 @@ export class PostgresTriageSystem implements TriageSystem {
            ORDER BY record->>'decidedAt' DESC LIMIT 1`,
         [id],
       ),
-      this.pool.query<{ record: unknown }>(
-        `SELECT record FROM workflow_actions WHERE triage_case_id = $1
-           ORDER BY CASE record->>'type'
-             WHEN 'create_incident' THEN 1 WHEN 'assign_owner' THEN 2 ELSE 3 END`,
-        [id],
-      ),
+      loadWorkflowActions(this.pool, 'triage_case_id', id),
       this.pool.query<{ id: string }>(
         'SELECT id FROM incidents WHERE triage_case_id = $1',
         [id],
@@ -788,7 +957,7 @@ export class PostgresTriageSystem implements TriageSystem {
       reviewTask: reviewResult.rows[0]?.record ?? null,
       corroboratingFacts: factResult.rows.map((row) => row.record),
       policyDecision: policyResult.rows[0]?.record ?? null,
-      workflowActions: actionResult.rows.map((row) => row.record),
+      workflowActions: actionResult,
       timelineEvents: timelineResult.rows.map((row) => row.record),
       incidentId: incidentResult.rows[0]?.id ?? null,
     });
@@ -810,6 +979,7 @@ export class PostgresTriageSystem implements TriageSystem {
     const [
       signalResult,
       evaluationResult,
+      reviewResult,
       factResult,
       policyResult,
       actionResult,
@@ -824,6 +994,10 @@ export class PostgresTriageSystem implements TriageSystem {
         [incidentRow.triage_case_id],
       ),
       this.pool.query<{ record: unknown }>(
+        'SELECT record FROM review_tasks WHERE triage_case_id = $1',
+        [incidentRow.triage_case_id],
+      ),
+      this.pool.query<{ record: unknown }>(
         "SELECT record FROM corroborating_facts WHERE triage_case_id = $1 ORDER BY record->>'kind'",
         [incidentRow.triage_case_id],
       ),
@@ -832,12 +1006,7 @@ export class PostgresTriageSystem implements TriageSystem {
            ORDER BY record->>'decidedAt' DESC LIMIT 1`,
         [incidentRow.triage_case_id],
       ),
-      this.pool.query<{ record: unknown }>(
-        `SELECT record FROM workflow_actions WHERE incident_id = $1
-           ORDER BY CASE record->>'type'
-             WHEN 'create_incident' THEN 1 WHEN 'assign_owner' THEN 2 ELSE 3 END`,
-        [id],
-      ),
+      loadWorkflowActions(this.pool, 'incident_id', id),
       this.pool.query<{ record: unknown }>(
         `SELECT record FROM timeline_events WHERE incident_id = $1
            ORDER BY CASE record->>'type'
@@ -850,9 +1019,10 @@ export class PostgresTriageSystem implements TriageSystem {
       incident: incidentRow.record,
       signal: mapSignal(signalResult.rows[0]!),
       evaluation: evaluationResult.rows[0]!.record,
+      reviewTask: reviewResult.rows[0]?.record ?? null,
       corroboratingFacts: factResult.rows.map((row) => row.record),
       policyDecision: policyResult.rows[0]!.record,
-      workflowActions: actionResult.rows.map((row) => row.record),
+      workflowActions: actionResult,
       timelineEvents: timelineResult.rows.map((row) => row.record),
     });
   }
@@ -867,6 +1037,14 @@ class SimulatedPagingProvider implements PagingProviderPort<PageRequest> {
       `simulated:${page.idempotencyKey}`;
     this.#providerReferences.set(page.idempotencyKey, providerReference);
     return { providerReference };
+  }
+}
+
+class SimulatedAssignmentProvider implements AssignmentProviderPort<AssignmentRequest> {
+  async assign(
+    assignment: AssignmentRequest,
+  ): Promise<{ providerReference: string }> {
+    return { providerReference: `simulated:${assignment.idempotencyKey}` };
   }
 }
 
@@ -931,19 +1109,29 @@ export class PgBossTriageWorker {
   constructor(
     private readonly pool: Pool,
     private readonly queue: TriageJobQueue,
+    private readonly actionQueue: PgBossJobQueue<WorkflowActionJobMessageV1>,
     private readonly clock: Clock,
     private readonly pagingProvider: PagingProviderPort<PageRequest>,
+    private readonly assignmentProvider: AssignmentProviderPort<AssignmentRequest>,
     private readonly judgmentProvider: OperationalJudgmentProviderPort<
       EvaluationInput,
       OperationalJudgments
     >,
+    private readonly claimLeaseMs: number,
+    private readonly afterProviderEffect: (
+      action: WorkflowAction,
+    ) => Promise<void>,
   ) {}
 
   async start(): Promise<void> {
     await ensureApplicationSchema(this.pool);
     await this.queue.start();
+    await this.actionQueue.start();
     await this.queue.process(async (message, transaction) => {
       await this.process(message, transaction);
+    });
+    await this.actionQueue.process(async (message) => {
+      await this.executeAction(message);
     });
   }
 
@@ -1199,7 +1387,7 @@ export class PgBossTriageWorker {
       title: signal.title ?? 'Checkout payment authorization failures',
       status: 'open',
       currentPriority: judgments.priorityAssessment.choice,
-      primaryOwningDomain: judgments.primaryOwningDomain.choice,
+      primaryOwningDomain: 'unknown',
       createdAt: evaluatedAt,
       correlationId: message.correlationId,
     });
@@ -1208,55 +1396,44 @@ export class PgBossTriageWorker {
       [incident.id, message.triageCaseId, JSON.stringify(incident)],
     );
 
-    await this.recordAction(
+    await this.createAction(
       transaction,
       message.triageCaseId,
       incident,
+      policyDecision,
       'create_incident',
-      `workflow:create_incident:${message.triageCaseId}`,
+      'succeeded',
       null,
-      'incident_created',
-      'Incident created open from the authorized Policy Decision.',
       evaluatedAt,
     );
     if (automation.authorizedActions.includes('assign_owner')) {
-      await this.recordAction(
+      const assignment = await this.createAction(
         transaction,
         message.triageCaseId,
         incident,
+        policyDecision,
         'assign_owner',
-        `workflow:assign_owner:${message.triageCaseId}:northstar-automation.v1`,
-        null,
-        'owner_assigned',
-        `${incident.primaryOwningDomain} assigned as Primary Owning Domain.`,
+        'pending',
+        judgments.primaryOwningDomain
+          .choice as AssignmentRequest['owningDomain'],
         evaluatedAt,
       );
+      await this.enqueueAction(transaction, assignment);
     }
     if (automation.authorizedActions.includes('page_on_call')) {
-      const idempotencyKey = `workflow:page_on_call:${message.triageCaseId}:northstar-automation.v1`;
-      const page = PageRequestSchema.parse({
-        incidentId: incident.id,
-        correlationId: message.correlationId,
-        priority: incident.currentPriority,
-        owningDomain: incident.primaryOwningDomain,
-        summary: incident.title,
-        idempotencyKey,
-      });
-      const result = await this.pagingProvider.page(page);
-      await this.recordAction(
+      await this.createAction(
         transaction,
         message.triageCaseId,
         incident,
+        policyDecision,
         'page_on_call',
-        idempotencyKey,
-        result.providerReference,
-        'on_call_paged',
-        `${incident.primaryOwningDomain} On-call Engineer paged.`,
+        'pending',
+        judgments.primaryOwningDomain.choice as PageRequest['owningDomain'],
         evaluatedAt,
       );
     }
 
-    if (incident.primaryOwningDomain === 'unknown') {
+    if (judgments.primaryOwningDomain.choice === 'unknown') {
       const reviewTask = ReviewTaskSchema.parse({
         id: randomUUID(),
         triageCaseId: message.triageCaseId,
@@ -1281,39 +1458,31 @@ export class PgBossTriageWorker {
     );
   }
 
-  private async recordAction(
+  private async createAction(
     transaction: TransactionalDatabase,
     triageCaseId: string,
     incident: Incident,
+    policyDecision: PolicyDecision,
     type: WorkflowAction['type'],
-    idempotencyKey: string,
-    providerReference: string | null,
-    timelineType: TimelineEvent['type'],
-    summary: string,
+    status: WorkflowAction['status'],
+    targetOwningDomain: WorkflowAction['targetOwningDomain'],
     occurredAt: string,
-  ): Promise<void> {
+  ): Promise<WorkflowAction> {
+    const idempotencyKey = `workflow:${policyDecision.version}:${policyDecision.id}:${type}`;
     const action = WorkflowActionSchema.parse({
-      id: randomUUID(),
+      id: workflowActionId(idempotencyKey),
       correlationId: incident.correlationId,
+      policyDecisionId: policyDecision.id,
       type,
-      status: 'succeeded',
+      targetOwningDomain,
+      status,
       idempotencyKey,
-      providerReference,
-      attempts: [
-        {
-          id: randomUUID(),
-          attemptedAt: occurredAt,
-          outcome: 'succeeded',
-          providerReference,
-        },
-      ],
-    });
-    const timelineEvent = TimelineEventSchema.parse({
-      id: randomUUID(),
-      correlationId: incident.correlationId,
-      type: timelineType,
-      occurredAt,
-      summary,
+      providerReference: null,
+      nextRetryAt: null,
+      maxAttempts: 3,
+      suppressedCount: 0,
+      failureReason: null,
+      attempts: [],
     });
     await transaction.executeSql(
       `INSERT INTO workflow_actions (
@@ -1324,16 +1493,509 @@ export class PgBossTriageWorker {
         triageCaseId,
         incident.id,
         idempotencyKey,
-        JSON.stringify(action),
+        JSON.stringify(WorkflowActionDefinitionSchema.parse(action)),
       ],
     );
     await transaction.executeSql(
-      'INSERT INTO timeline_events (id, incident_id, record) VALUES ($1, $2, $3::jsonb)',
-      [timelineEvent.id, incident.id, JSON.stringify(timelineEvent)],
+      `INSERT INTO effects_ledger
+         (idempotency_key, action_id, status)
+       VALUES ($1, $2, $3)`,
+      [action.idempotencyKey, action.id, status],
+    );
+    if (status === 'succeeded') {
+      await this.appendAttempt(
+        transaction,
+        action.id,
+        1,
+        'started',
+        occurredAt,
+      );
+      await this.appendAttempt(
+        transaction,
+        action.id,
+        2,
+        'succeeded',
+        occurredAt,
+      );
+      await this.appendTimeline(
+        transaction,
+        incident.id,
+        incident.correlationId,
+        'incident_created',
+        'Incident created open from the authorized Policy Decision.',
+        occurredAt,
+      );
+    }
+    return action;
+  }
+
+  private async appendAttempt(
+    transaction: TransactionalDatabase,
+    actionId: string,
+    sequence: number,
+    outcome:
+      | 'started'
+      | 'succeeded'
+      | 'transient_failure'
+      | 'permanent_failure'
+      | 'interrupted'
+      | 'suppressed',
+    attemptedAt: string,
+    providerReference: string | null = null,
+    detail: string | null = null,
+  ): Promise<void> {
+    const attempt = ActionAttemptSchema.parse({
+      id: randomUUID(),
+      sequence,
+      attemptedAt,
+      outcome,
+      providerReference,
+      detail,
+    });
+    await transaction.executeSql(
+      `INSERT INTO action_attempts (id, action_id, sequence, record)
+       VALUES ($1, $2, $3, $4::jsonb)`,
+      [attempt.id, actionId, sequence, JSON.stringify(attempt)],
     );
   }
 
+  private async appendTimeline(
+    transaction: TransactionalDatabase,
+    incidentId: string,
+    correlationId: string,
+    type: TimelineEvent['type'],
+    summary: string,
+    occurredAt: string,
+  ): Promise<void> {
+    const event = TimelineEventSchema.parse({
+      id: randomUUID(),
+      correlationId,
+      type,
+      occurredAt,
+      summary,
+    });
+    await transaction.executeSql(
+      'INSERT INTO timeline_events (id, incident_id, record) VALUES ($1, $2, $3::jsonb)',
+      [event.id, incidentId, JSON.stringify(event)],
+    );
+  }
+
+  private async enqueueAction(
+    transaction: TransactionalDatabase,
+    action: WorkflowAction,
+    startAfter?: string,
+  ): Promise<void> {
+    await this.actionQueue.enqueue(
+      { version: 1, actionId: action.id, correlationId: action.correlationId },
+      { id: randomUUID(), transaction, ...(startAfter ? { startAfter } : {}) },
+    );
+  }
+
+  private async saveActionState(
+    transaction: TransactionalDatabase,
+    action: WorkflowAction,
+  ): Promise<void> {
+    await transaction.executeSql(
+      `UPDATE effects_ledger SET status = $2, provider_reference = $3,
+         next_retry_at = $4, suppressed_count = $5, failure_reason = $6
+       WHERE action_id = $1`,
+      [
+        action.id,
+        action.status,
+        action.providerReference,
+        action.nextRetryAt,
+        action.suppressedCount,
+        action.failureReason,
+      ],
+    );
+  }
+
+  private async urgentFailureReview(
+    transaction: TransactionalDatabase,
+    triageCaseId: string,
+    correlationId: string,
+    reason: string,
+  ): Promise<void> {
+    const review = ReviewTaskSchema.parse({
+      id: randomUUID(),
+      triageCaseId,
+      correlationId,
+      urgency: 'urgent',
+      reason,
+      createdAt: this.clock.now().toISOString(),
+    });
+    await transaction.executeSql(
+      `INSERT INTO review_tasks (id, triage_case_id, record)
+       VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (triage_case_id) DO UPDATE SET record =
+         jsonb_set(
+           jsonb_set(review_tasks.record, '{urgency}', '"urgent"'::jsonb),
+           '{reason}', to_jsonb($4::text)
+         )`,
+      [review.id, triageCaseId, JSON.stringify(review), reason],
+    );
+    await transaction.executeSql(
+      "UPDATE triage_cases SET status = 'needs_review' WHERE id = $1",
+      [triageCaseId],
+    );
+  }
+
+  private async executeAction(
+    message: WorkflowActionJobMessageV1,
+  ): Promise<void> {
+    const client = await this.pool.connect();
+    let claimed: {
+      action: WorkflowAction;
+      incidentId: string;
+      triageCaseId: string;
+      token: string;
+    } | null = null;
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<
+        WorkflowActionStateRow & {
+          incident_id: string;
+          triage_case_id: string;
+          claimed_at: Date | null;
+        }
+      >(
+        `SELECT w.incident_id, w.triage_case_id, w.record,
+                l.status, l.provider_reference, l.next_retry_at,
+                l.suppressed_count, l.failure_reason, l.claimed_at
+         FROM workflow_actions w
+         JOIN effects_ledger l ON l.action_id = w.id
+         WHERE w.id = $1 FOR UPDATE OF w, l`,
+        [message.actionId],
+      );
+      const row = result.rows[0];
+      if (!row) throw new Error('Workflow Action was not found');
+      const action = mapWorkflowAction(row);
+      if (action.correlationId !== message.correlationId)
+        throw new Error('Workflow Action correlation mismatch');
+      const countResult = await client.query<{
+        sequence: number;
+        starts: number;
+      }>(
+        `SELECT COALESCE(MAX(sequence), 0)::int AS sequence,
+                COUNT(*) FILTER (WHERE record->>'outcome' = 'started')::int AS starts
+         FROM action_attempts WHERE action_id = $1`,
+        [action.id],
+      );
+      let sequence = countResult.rows[0]!.sequence;
+      const startedCount = countResult.rows[0]!.starts;
+      const now = this.clock.now().toISOString();
+      const transaction = clientDatabase(client);
+      if (
+        action.status === 'succeeded' ||
+        action.status === 'permanently_failed' ||
+        (action.status === 'executing' &&
+          row.claimed_at &&
+          Date.now() - row.claimed_at.getTime() < this.claimLeaseMs) ||
+        (action.status === 'retry_scheduled' &&
+          action.nextRetryAt &&
+          Date.now() < new Date(action.nextRetryAt).getTime())
+      ) {
+        action.suppressedCount++;
+        await this.appendAttempt(
+          transaction,
+          action.id,
+          ++sequence,
+          'suppressed',
+          now,
+          null,
+          `Duplicate delivery while action was ${action.status}.`,
+        );
+        await this.saveActionState(transaction, action);
+        if (action.status === 'executing')
+          await this.enqueueAction(
+            transaction,
+            action,
+            `${Math.ceil(this.claimLeaseMs / 1000)} seconds`,
+          );
+        await client.query('COMMIT');
+        return;
+      }
+      if (action.status === 'executing')
+        await this.appendAttempt(
+          transaction,
+          action.id,
+          ++sequence,
+          'interrupted',
+          now,
+          null,
+          'Previous worker stopped before recording the provider result.',
+        );
+      if (startedCount >= action.maxAttempts) {
+        action.status = 'permanently_failed';
+        action.failureReason =
+          'Execution attempts exhausted after worker interruption.';
+        await this.saveActionState(transaction, action);
+        await client.query(
+          `UPDATE effects_ledger SET status = 'permanently_failed',
+          claim_token = NULL WHERE action_id = $1`,
+          [action.id],
+        );
+        await this.urgentFailureReview(
+          transaction,
+          row.triage_case_id,
+          action.correlationId,
+          `${action.type} permanently failed: ${action.failureReason}`,
+        );
+        await client.query('COMMIT');
+        return;
+      }
+      const token = randomUUID();
+      action.status = 'executing';
+      action.nextRetryAt = null;
+      await this.appendAttempt(
+        transaction,
+        action.id,
+        ++sequence,
+        'started',
+        now,
+      );
+      await this.saveActionState(transaction, action);
+      await client.query(
+        `UPDATE effects_ledger SET status = 'executing',
+        claimed_at = now(), claim_token = $2 WHERE action_id = $1`,
+        [action.id, token],
+      );
+      await client.query('COMMIT');
+      claimed = {
+        action,
+        incidentId: row.incident_id,
+        triageCaseId: row.triage_case_id,
+        token,
+      };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+    if (!claimed) return;
+    const { action, incidentId } = claimed;
+    const incidentResult = await this.pool.query<{ record: Incident }>(
+      'SELECT record FROM incidents WHERE id = $1',
+      [incidentId],
+    );
+    const incident = IncidentSchema.parse(incidentResult.rows[0]!.record);
+    let providerReference: string | null = null;
+    let failure: unknown = null;
+    try {
+      if (action.type === 'assign_owner') {
+        const result = await this.assignmentProvider.assign(
+          AssignmentRequestSchema.parse({
+            incidentId,
+            correlationId: action.correlationId,
+            owningDomain: action.targetOwningDomain,
+            idempotencyKey: action.idempotencyKey,
+          }),
+        );
+        providerReference = result.providerReference;
+      } else if (action.type === 'page_on_call') {
+        const result = await this.pagingProvider.page(
+          PageRequestSchema.parse({
+            incidentId,
+            correlationId: action.correlationId,
+            priority: incident.currentPriority,
+            owningDomain: action.targetOwningDomain,
+            summary: incident.title,
+            idempotencyKey: action.idempotencyKey,
+          }),
+        );
+        providerReference = result.providerReference;
+      } else {
+        throw new Error(
+          'Incident creation is committed with its Policy Decision',
+        );
+      }
+    } catch (error) {
+      failure = error;
+      if (error instanceof WorkflowProviderError)
+        providerReference = error.providerReference;
+    }
+    if (!failure) await this.afterProviderEffect(action);
+    await this.finishAction(claimed, providerReference, failure);
+  }
+
+  private async finishAction(
+    claim: {
+      action: WorkflowAction;
+      incidentId: string;
+      triageCaseId: string;
+      token: string;
+    },
+    providerReference: string | null,
+    failure: unknown,
+  ): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<
+        WorkflowActionStateRow & {
+          claim_token: string;
+        }
+      >(
+        `SELECT w.record, l.status, l.provider_reference, l.next_retry_at,
+                l.suppressed_count, l.failure_reason, l.claim_token
+         FROM workflow_actions w
+         JOIN effects_ledger l ON l.action_id = w.id
+         WHERE w.id = $1 FOR UPDATE OF w, l`,
+        [claim.action.id],
+      );
+      const row = result.rows[0]!;
+      if (row.claim_token !== claim.token) {
+        await client.query('COMMIT');
+        return;
+      }
+      const action = mapWorkflowAction(row);
+      const sequenceResult = await client.query<{
+        next_sequence: number;
+        starts: number;
+      }>(
+        `SELECT (COALESCE(MAX(sequence), 0) + 1)::int AS next_sequence,
+                COUNT(*) FILTER (WHERE record->>'outcome' = 'started')::int AS starts
+         FROM action_attempts WHERE action_id = $1`,
+        [action.id],
+      );
+      const { next_sequence: sequence, starts } = sequenceResult.rows[0]!;
+      const now = this.clock.now().toISOString();
+      const transaction = clientDatabase(client);
+      if (!failure) {
+        action.status = 'succeeded';
+        action.providerReference = providerReference;
+        action.failureReason = null;
+        await this.appendAttempt(
+          transaction,
+          action.id,
+          sequence,
+          'succeeded',
+          now,
+          providerReference,
+        );
+        if (action.type === 'assign_owner') {
+          await client.query(
+            `UPDATE incidents SET record = jsonb_set(record,
+            '{primaryOwningDomain}', to_jsonb($2::text)) WHERE id = $1`,
+            [claim.incidentId, action.targetOwningDomain],
+          );
+          await this.appendTimeline(
+            transaction,
+            claim.incidentId,
+            action.correlationId,
+            'owner_assigned',
+            `${action.targetOwningDomain} assigned as Primary Owning Domain.`,
+            now,
+          );
+          const pageResult = await client.query<WorkflowActionStateRow>(
+            `SELECT w.record, l.status, l.provider_reference, l.next_retry_at,
+                    l.suppressed_count, l.failure_reason
+             FROM workflow_actions w JOIN effects_ledger l ON l.action_id = w.id
+             WHERE w.triage_case_id = $1 AND w.record->>'type' = 'page_on_call'`,
+            [claim.triageCaseId],
+          );
+          if (pageResult.rows[0])
+            await this.enqueueAction(
+              transaction,
+              mapWorkflowAction(pageResult.rows[0]),
+            );
+        } else {
+          await this.appendTimeline(
+            transaction,
+            claim.incidentId,
+            action.correlationId,
+            'on_call_paged',
+            `${action.targetOwningDomain} On-call Engineer paged.`,
+            now,
+          );
+        }
+      } else {
+        const detail =
+          failure instanceof Error ? failure.message : String(failure);
+        const retryable =
+          !(failure instanceof WorkflowProviderError) || failure.retryable;
+        const terminal = !retryable || starts >= action.maxAttempts;
+        action.failureReason = detail;
+        action.providerReference =
+          providerReference ?? action.providerReference;
+        if (terminal) {
+          action.status = 'permanently_failed';
+          action.nextRetryAt = null;
+          await this.appendAttempt(
+            transaction,
+            action.id,
+            sequence,
+            'permanent_failure',
+            now,
+            providerReference,
+            detail,
+          );
+          await this.urgentFailureReview(
+            transaction,
+            claim.triageCaseId,
+            action.correlationId,
+            `${action.type} permanently failed: ${detail}`,
+          );
+          if (action.type === 'assign_owner') {
+            const pageResult = await client.query<WorkflowActionStateRow>(
+              `SELECT w.record, l.status, l.provider_reference, l.next_retry_at,
+                      l.suppressed_count, l.failure_reason
+               FROM workflow_actions w JOIN effects_ledger l ON l.action_id = w.id
+               WHERE w.triage_case_id = $1 AND w.record->>'type' = 'page_on_call'
+               FOR UPDATE OF w, l`,
+              [claim.triageCaseId],
+            );
+            if (pageResult.rows[0]) {
+              const page = mapWorkflowAction(pageResult.rows[0]);
+              page.status = 'permanently_failed';
+              page.failureReason = 'Owner assignment failed; page suppressed.';
+              await this.saveActionState(transaction, page);
+              await this.appendAttempt(
+                transaction,
+                page.id,
+                1,
+                'suppressed',
+                now,
+                null,
+                page.failureReason,
+              );
+            }
+          }
+        } else {
+          const delay = 2 ** (starts - 1);
+          action.status = 'retry_scheduled';
+          action.nextRetryAt = new Date(
+            Date.now() + delay * 1000,
+          ).toISOString();
+          await this.appendAttempt(
+            transaction,
+            action.id,
+            sequence,
+            'transient_failure',
+            now,
+            providerReference,
+            detail,
+          );
+          await this.enqueueAction(transaction, action, `${delay} seconds`);
+        }
+      }
+      await this.saveActionState(transaction, action);
+      await client.query(
+        'UPDATE effects_ledger SET claim_token = NULL WHERE action_id = $1',
+        [action.id],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async stop(): Promise<void> {
+    await this.actionQueue.stop();
     await this.queue.stop();
     await this.pool.end();
   }
@@ -1357,6 +2019,9 @@ interface TriageWorkerRuntimeOptions {
   queueName?: string;
   clock?: Clock;
   pagingProvider?: PagingProviderPort<PageRequest>;
+  assignmentProvider?: AssignmentProviderPort<AssignmentRequest>;
+  claimLeaseMs?: number;
+  afterProviderEffect?: (action: WorkflowAction) => Promise<void>;
   judgmentProvider?: OperationalJudgmentProviderPort<
     EvaluationInput,
     OperationalJudgments
@@ -1401,7 +2066,12 @@ export function createPostgresTriageSystem({
   const queue =
     providedQueue ??
     new PgBossJobQueue(connectionString, queueName, TriageJobMessageV1Schema);
-  return new PostgresTriageSystem(pool, queue, clock);
+  const actionQueue = new PgBossJobQueue(
+    connectionString,
+    `${queueName}-actions`,
+    WorkflowActionJobMessageV1Schema,
+  );
+  return new PostgresTriageSystem(pool, queue, actionQueue, clock);
 }
 
 export function createPostgresTriageWorker({
@@ -1409,7 +2079,10 @@ export function createPostgresTriageWorker({
   queueName = TRIAGE_QUEUE,
   clock = { now: () => new Date() },
   pagingProvider = new SimulatedPagingProvider(),
+  assignmentProvider = new SimulatedAssignmentProvider(),
   judgmentProvider = new DeterministicOperationalJudgmentProvider(),
+  claimLeaseMs = 30_000,
+  afterProviderEffect = async () => undefined,
 }: TriageWorkerRuntimeOptions): PgBossTriageWorker {
   const pool = new PostgresPool({ connectionString });
   const queue = new PgBossJobQueue(
@@ -1417,11 +2090,20 @@ export function createPostgresTriageWorker({
     queueName,
     TriageJobMessageV1Schema,
   );
+  const actionQueue = new PgBossJobQueue(
+    connectionString,
+    `${queueName}-actions`,
+    WorkflowActionJobMessageV1Schema,
+  );
   return new PgBossTriageWorker(
     pool,
     queue,
+    actionQueue,
     clock,
     pagingProvider,
+    assignmentProvider,
     judgmentProvider,
+    claimLeaseMs,
+    afterProviderEffect,
   );
 }

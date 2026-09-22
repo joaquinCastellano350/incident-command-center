@@ -42,6 +42,21 @@ function facts(signal: Signal): Array<[string, string]> {
   ]);
 }
 
+function executionCount(action: WorkflowAction): number {
+  const started = action.attempts.filter(
+    (attempt) => attempt.outcome === 'started',
+  ).length;
+  const completed = action.attempts.filter((attempt) =>
+    [
+      'succeeded',
+      'transient_failure',
+      'permanent_failure',
+      'interrupted',
+    ].includes(attempt.outcome),
+  ).length;
+  return Math.max(started, completed);
+}
+
 export function DecisionTrace({
   signal,
   evaluation,
@@ -324,11 +339,18 @@ export function DecisionTrace({
       </TabsContent>
 
       <TabsContent value="actions" className="mt-4">
+        {reviewTask?.urgency === 'urgent' && (
+          <Alert variant="destructive" className="mb-4">
+            <AlertTitle>Operator attention required</AlertTitle>
+            <AlertDescription>{reviewTask.reason}</AlertDescription>
+          </Alert>
+        )}
         <Card>
           <CardHeader>
             <CardTitle>Workflow Actions</CardTitle>
             <CardDescription>
-              Authorized effects and provider correlations
+              Current state, provider effects, retries, and duplicate
+              suppression
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -338,20 +360,100 @@ export function DecisionTrace({
               </p>
             ) : (
               workflowActions.map((action) => (
-                <div key={action.id} className="rounded-md border p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="font-medium">{label(action.type)}</p>
-                    <Badge variant="secondary">{label(action.status)}</Badge>
-                  </div>
-                  <p className="mt-2 break-all font-mono text-xs text-muted-foreground">
-                    {action.idempotencyKey}
-                  </p>
-                  {action.providerReference && (
-                    <p className="mt-1 break-all text-xs text-muted-foreground">
-                      Provider: {action.providerReference}
-                    </p>
-                  )}
-                </div>
+                <Card key={action.id} size="sm">
+                  <CardContent className="space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <p className="font-medium">{label(action.type)}</p>
+                      <Badge
+                        variant={
+                          action.status === 'permanently_failed'
+                            ? 'destructive'
+                            : action.status === 'succeeded'
+                              ? 'secondary'
+                              : 'outline'
+                        }
+                      >
+                        {label(action.status)}
+                      </Badge>
+                    </div>
+                    <div className="grid gap-3 text-sm sm:grid-cols-2">
+                      <Detail
+                        label="Policy Decision"
+                        value={action.policyDecisionId}
+                      />
+                      <Detail
+                        label="Idempotency key"
+                        value={action.idempotencyKey}
+                      />
+                      <Detail
+                        label="Provider reference"
+                        value={action.providerReference ?? 'Pending'}
+                      />
+                      <Detail
+                        label="Attempts"
+                        value={`${executionCount(action)} of ${action.maxAttempts}`}
+                      />
+                      <Detail
+                        label="Duplicates suppressed"
+                        value={String(action.suppressedCount)}
+                      />
+                      {action.nextRetryAt && (
+                        <Detail label="Next retry" value={action.nextRetryAt} />
+                      )}
+                    </div>
+                    {action.failureReason && (
+                      <Alert
+                        variant={
+                          action.status === 'permanently_failed'
+                            ? 'destructive'
+                            : 'default'
+                        }
+                      >
+                        <AlertTitle>
+                          {action.status === 'permanently_failed'
+                            ? 'Terminal failure'
+                            : 'Retry scheduled'}
+                        </AlertTitle>
+                        <AlertDescription>
+                          {action.failureReason}
+                        </AlertDescription>
+                      </Alert>
+                    )}
+                    {action.attempts.length > 0 && (
+                      <div>
+                        <p className="text-xs font-medium text-muted-foreground">
+                          Action Attempts
+                        </p>
+                        <ol className="mt-2 space-y-2 text-sm">
+                          {action.attempts.map((attempt) => (
+                            <li
+                              key={attempt.id}
+                              className="flex flex-wrap gap-x-3 gap-y-1"
+                            >
+                              <span className="font-mono text-xs text-muted-foreground">
+                                #{attempt.sequence}
+                              </span>
+                              <span>{label(attempt.outcome)}</span>
+                              <time className="text-xs text-muted-foreground">
+                                {attempt.attemptedAt}
+                              </time>
+                              {attempt.providerReference && (
+                                <span className="break-all text-xs">
+                                  {attempt.providerReference}
+                                </span>
+                              )}
+                              {attempt.detail && (
+                                <span className="w-full text-xs text-muted-foreground">
+                                  {attempt.detail}
+                                </span>
+                              )}
+                            </li>
+                          ))}
+                        </ol>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
               ))
             )}
           </CardContent>

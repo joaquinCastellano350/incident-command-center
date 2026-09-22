@@ -21,6 +21,12 @@ The worker defaults to **live** Jev mode with the pinned `jev-1.13.0` model. Set
 
 Run the opt-in live provider contract smoke test with `LIVE_JEV_SMOKE=1` and `TYPESAFE_API_KEY` set: `npx vitest run tests/smoke/jev-live.test.ts`. Ordinary tests use deterministic or recorded adapters and do not call TypeSafe.
 
+## Workflow trust drill
+
+Run `npm run trust:drill` to submit a provider-shaped Monitoring Alert, simulate a worker crash immediately after a page provider effect, and replay the Workflow Action and source payload. The command prints the Incident ID, the page action's stable key and append-only Action Attempts, duplicate suppression count, and observable page count. It uses a temporary PostgreSQL database and removes that database when finished. The provider is deterministic for this drill; no real on-call engineer is paged.
+
+Workflow Actions show pending, executing, retry scheduled, succeeded, or permanently failed in both the Triage Case and Incident views. The Actions tab lists provider references, attempt outcomes, next retry time, suppressed deliveries, and terminal failure details. A permanently failed assignment or page leaves the open Incident intact and creates an urgent Review Task.
+
 Stop the application with `npm run dev:down`. To also remove the local database volume, use `npm run dev:reset`.
 
 ## Quality

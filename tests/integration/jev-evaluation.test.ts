@@ -15,7 +15,8 @@ import {
   TriageCaseDetailSchema,
 } from '@incident-command-center/contracts';
 import { ManualClock } from '@incident-command-center/testing';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { Pool } from 'pg';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const describeWithPostgres = databaseUrl ? describe : describe.skip;
@@ -32,18 +33,25 @@ describeWithPostgres(
   () => {
     const clock = new ManualClock('2026-09-21T12:04:00.000Z');
     const queueName = `jev-evaluation-${randomUUID()}`;
+    const databaseName = `incident_test_${randomUUID().replaceAll('-', '_')}`;
+    const adminUrl = new URL(databaseUrl ?? 'postgres://localhost/postgres');
+    adminUrl.pathname = '/postgres';
+    const isolatedUrl = new URL(databaseUrl ?? 'postgres://localhost/postgres');
+    isolatedUrl.pathname = `/${databaseName}`;
+    const admin = new Pool({ connectionString: adminUrl.toString() });
     let healthSystem: ReturnType<typeof createPostgresHealthSystem>;
     let triageSystem: ReturnType<typeof createPostgresTriageSystem>;
     let api: Awaited<ReturnType<typeof buildApi>>;
 
     beforeAll(async () => {
+      await admin.query(`CREATE DATABASE ${databaseName}`);
       healthSystem = createPostgresHealthSystem({
-        connectionString: databaseUrl!,
+        connectionString: isolatedUrl.toString(),
         clock,
         queueName: `health-${randomUUID()}`,
       });
       triageSystem = createPostgresTriageSystem({
-        connectionString: databaseUrl!,
+        connectionString: isolatedUrl.toString(),
         clock,
         queueName,
       });
@@ -61,6 +69,17 @@ describeWithPostgres(
       await api?.close();
       await triageSystem?.stop();
       await healthSystem?.stop();
+      await admin.query(`DROP DATABASE ${databaseName} WITH (FORCE)`);
+      await admin.end();
+    });
+
+    beforeEach(async () => {
+      const pool = new Pool({ connectionString: isolatedUrl.toString() });
+      try {
+        await pool.query('TRUNCATE signals CASCADE');
+      } finally {
+        await pool.end();
+      }
     });
 
     async function submitAlert(signalFacts = expectedSignal) {
@@ -95,7 +114,7 @@ describeWithPostgres(
       );
       const accepted = await submitAlert();
       const worker = createPostgresTriageWorker({
-        connectionString: databaseUrl!,
+        connectionString: isolatedUrl.toString(),
         queueName,
         clock,
         judgmentProvider: new JevOperationalJudgmentProvider(
@@ -159,7 +178,7 @@ describeWithPostgres(
       };
       const accepted = await submitAlert(invalidSignal);
       const worker = createPostgresTriageWorker({
-        connectionString: databaseUrl!,
+        connectionString: isolatedUrl.toString(),
         queueName,
         clock,
         judgmentProvider: new JevOperationalJudgmentProvider(
@@ -240,7 +259,7 @@ describeWithPostgres(
       );
       const deployment = recordings[1];
       const worker = createPostgresTriageWorker({
-        connectionString: databaseUrl!,
+        connectionString: isolatedUrl.toString(),
         queueName,
         clock,
         judgmentProvider: new JevOperationalJudgmentProvider(

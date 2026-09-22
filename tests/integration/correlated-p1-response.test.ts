@@ -13,10 +13,15 @@ import {
   MonitoringAlertIngestionResultSchema,
   PageRequestSchema,
   TriageCaseDetailSchema,
+  type AssignmentRequest,
   type PageRequest,
 } from '@incident-command-center/contracts';
-import type { PagingProviderPort } from '@incident-command-center/domain';
+import type {
+  AssignmentProviderPort,
+  PagingProviderPort,
+} from '@incident-command-center/domain';
 import { ManualClock } from '@incident-command-center/testing';
+import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -31,22 +36,40 @@ class RecordingPagingProvider implements PagingProviderPort<PageRequest> {
   }
 }
 
+class RecordingAssignmentProvider implements AssignmentProviderPort<AssignmentRequest> {
+  readonly calls: AssignmentRequest[] = [];
+
+  async assign(
+    assignment: AssignmentRequest,
+  ): Promise<{ providerReference: string }> {
+    this.calls.push(assignment);
+    return { providerReference: `assignment-${this.calls.length}` };
+  }
+}
+
 describeWithPostgres('canonical correlated P1 response', () => {
   const clock = new ManualClock('2026-09-21T12:00:00.000Z');
   const queueName = `${TRIAGE_QUEUE}-${randomUUID()}`;
+  const databaseName = `incident_test_${randomUUID().replaceAll('-', '_')}`;
+  const adminUrl = new URL(databaseUrl ?? 'postgres://localhost/postgres');
+  adminUrl.pathname = '/postgres';
+  const isolatedUrl = new URL(databaseUrl ?? 'postgres://localhost/postgres');
+  isolatedUrl.pathname = `/${databaseName}`;
+  const admin = new Pool({ connectionString: adminUrl.toString() });
   let healthSystem: ReturnType<typeof createPostgresHealthSystem>;
   let triageSystem: ReturnType<typeof createPostgresTriageSystem>;
   let api: Awaited<ReturnType<typeof buildApi>>;
 
   beforeAll(async () => {
+    await admin.query(`CREATE DATABASE ${databaseName}`);
     healthSystem = createPostgresHealthSystem({
-      connectionString: databaseUrl!,
+      connectionString: isolatedUrl.toString(),
       clock,
       queueName: `health-${randomUUID()}`,
     });
     await healthSystem.start();
     triageSystem = createPostgresTriageSystem({
-      connectionString: databaseUrl!,
+      connectionString: isolatedUrl.toString(),
       clock,
       queueName,
     });
@@ -63,6 +86,8 @@ describeWithPostgres('canonical correlated P1 response', () => {
     await api?.close();
     await triageSystem?.stop();
     await healthSystem?.stop();
+    await admin.query(`DROP DATABASE ${databaseName} WITH (FORCE)`);
+    await admin.end();
   });
 
   it('accepts and normalizes the checkout Deployment Event', async () => {
@@ -142,11 +167,13 @@ describeWithPostgres('canonical correlated P1 response', () => {
       alertResponse.json(),
     );
     const pagingProvider = new RecordingPagingProvider();
+    const assignmentProvider = new RecordingAssignmentProvider();
     const worker = createPostgresTriageWorker({
-      connectionString: databaseUrl!,
+      connectionString: isolatedUrl.toString(),
       queueName,
       clock,
       pagingProvider,
+      assignmentProvider,
     });
 
     await worker.start();
@@ -163,7 +190,14 @@ describeWithPostgres('canonical correlated P1 response', () => {
           },
           { timeout: 15_000, interval: 100 },
         )
-        .toMatchObject({ triageCase: { status: 'incident_created' } });
+        .toMatchObject({
+          triageCase: { status: 'incident_created' },
+          workflowActions: [
+            { status: 'succeeded' },
+            { status: 'succeeded' },
+            { status: 'succeeded' },
+          ],
+        });
 
       const detailResponse = await api.inject({
         method: 'GET',
@@ -243,11 +277,17 @@ describeWithPostgres('canonical correlated P1 response', () => {
       ]);
       expect(incidentDetail.workflowActions).toHaveLength(3);
       expect(pagingProvider.calls).toHaveLength(1);
+      expect(assignmentProvider.calls).toHaveLength(1);
+      expect(assignmentProvider.calls[0]?.idempotencyKey).toBe(
+        triageDetail.workflowActions.find(
+          (action) => action.type === 'assign_owner',
+        )?.idempotencyKey,
+      );
       expect(pagingProvider.calls[0]).toMatchObject({
         incidentId: incidentDetail.incident.id,
         priority: 'P1',
         owningDomain: 'payments',
-        idempotencyKey: `workflow:page_on_call:${alert.triageCase.id}:northstar-automation.v1`,
+        idempotencyKey: `workflow:northstar-automation.v1:${triageDetail.policyDecision!.id}:page_on_call`,
       });
       expect(
         incidentDetail.workflowActions.find(
@@ -267,12 +307,30 @@ describeWithPostgres('canonical correlated P1 response', () => {
       expect(replay.deduplicated).toBe(true);
       expect(replay.triageCase.id).toBe(alert.triageCase.id);
       expect(pagingProvider.calls).toHaveLength(1);
+      expect(assignmentProvider.calls).toHaveLength(1);
+      const afterReplay = TriageCaseDetailSchema.parse(
+        (
+          await api.inject({
+            method: 'GET',
+            url: `/api/v1/triage-cases/${alert.triageCase.id}`,
+          })
+        ).json(),
+      );
+      expect(afterReplay.workflowActions.map((action) => action.id)).toEqual(
+        triageDetail.workflowActions.map((action) => action.id),
+      );
     } finally {
       await worker.stop();
     }
   });
 
   it('does not page a high-confidence P1 assessment without a Corroborating Fact', async () => {
+    const pool = new Pool({ connectionString: isolatedUrl.toString() });
+    try {
+      await pool.query('TRUNCATE signals CASCADE');
+    } finally {
+      await pool.end();
+    }
     clock.set('2026-09-21T12:08:00.000Z');
     const response = await api.inject({
       method: 'POST',
@@ -293,7 +351,7 @@ describeWithPostgres('canonical correlated P1 response', () => {
     const alert = MonitoringAlertIngestionResultSchema.parse(response.json());
     const pagingProvider = new RecordingPagingProvider();
     const worker = createPostgresTriageWorker({
-      connectionString: databaseUrl!,
+      connectionString: isolatedUrl.toString(),
       queueName,
       clock,
       pagingProvider,
@@ -312,7 +370,10 @@ describeWithPostgres('canonical correlated P1 response', () => {
           },
           { timeout: 15_000, interval: 100 },
         )
-        .toMatchObject({ triageCase: { status: 'incident_created' } });
+        .toMatchObject({
+          triageCase: { status: 'incident_created' },
+          workflowActions: [{ status: 'succeeded' }, { status: 'succeeded' }],
+        });
 
       const detail = TriageCaseDetailSchema.parse(
         (

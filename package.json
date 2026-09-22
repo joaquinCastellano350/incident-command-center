@@ -26,6 +26,7 @@
     "postgres:up": "docker compose up -d --wait postgres",
     "test": "npm run postgres:up && cross-env TEST_DATABASE_URL=postgres://incident:incident@localhost:5432/incident_command_center vitest run",
     "test:integration": "cross-env TEST_DATABASE_URL=postgres://incident:incident@localhost:5432/incident_command_center vitest run tests/integration",
+    "trust:drill": "npm run postgres:up && tsx scripts/trust-drill.ts",
     "quality": "npm run format:check && npm run typecheck && npm test"
   },
   "devDependencies": {

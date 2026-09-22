@@ -405,18 +405,50 @@ export type PolicyDecision = z.infer<typeof PolicyDecisionSchema>;
 
 export const ActionAttemptSchema = z.object({
   id: z.uuid(),
+  sequence: z.number().int().positive(),
   attemptedAt: z.iso.datetime(),
-  outcome: z.literal('succeeded'),
+  outcome: z.enum([
+    'started',
+    'succeeded',
+    'transient_failure',
+    'permanent_failure',
+    'interrupted',
+    'suppressed',
+  ]),
   providerReference: z.string().nullable(),
+  detail: z.string().nullable(),
 });
 
-export const WorkflowActionSchema = z.object({
+export type ActionAttempt = z.infer<typeof ActionAttemptSchema>;
+
+export const WorkflowActionDefinitionSchema = z.object({
   id: z.uuid(),
   correlationId: z.uuid(),
+  policyDecisionId: z.uuid(),
   type: WorkflowActionTypeSchema,
-  status: z.literal('succeeded'),
+  targetOwningDomain: z
+    .enum(['payments', 'authentication', 'fulfillment', 'platform'])
+    .nullable(),
   idempotencyKey: z.string(),
+  maxAttempts: z.number().int().positive(),
+});
+
+export type WorkflowActionDefinition = z.infer<
+  typeof WorkflowActionDefinitionSchema
+>;
+
+export const WorkflowActionSchema = WorkflowActionDefinitionSchema.extend({
+  status: z.enum([
+    'pending',
+    'executing',
+    'retry_scheduled',
+    'succeeded',
+    'permanently_failed',
+  ]),
   providerReference: z.string().nullable(),
+  nextRetryAt: z.iso.datetime().nullable(),
+  suppressedCount: z.number().int().nonnegative(),
+  failureReason: z.string().nullable(),
   attempts: z.array(ActionAttemptSchema),
 });
 
@@ -477,6 +509,7 @@ export const IncidentDetailSchema = z.object({
   incident: IncidentSchema,
   signal: SignalSchema,
   evaluation: EvaluationSchema,
+  reviewTask: ReviewTaskSchema.nullable(),
   corroboratingFacts: z.array(CorroboratingFactSchema),
   policyDecision: PolicyDecisionSchema,
   workflowActions: z.array(WorkflowActionSchema),
@@ -500,6 +533,30 @@ export const PageRequestSchema = z.object({
 });
 
 export type PageRequest = z.infer<typeof PageRequestSchema>;
+
+export const AssignmentRequestSchema = z.object({
+  incidentId: z.uuid(),
+  correlationId: z.uuid(),
+  owningDomain: z.enum([
+    'payments',
+    'authentication',
+    'fulfillment',
+    'platform',
+  ]),
+  idempotencyKey: z.string(),
+});
+
+export type AssignmentRequest = z.infer<typeof AssignmentRequestSchema>;
+
+export const WorkflowActionJobMessageV1Schema = z.object({
+  version: z.literal(1),
+  actionId: z.uuid(),
+  correlationId: z.uuid(),
+});
+
+export type WorkflowActionJobMessageV1 = z.infer<
+  typeof WorkflowActionJobMessageV1Schema
+>;
 
 export const TriageQueueSchema = z.object({
   items: z.array(TriageCaseSchema),
