@@ -1,0 +1,146 @@
+[
+  {
+    "requestId": "recorded:canonical-p1-v1",
+    "expectedSignal": {
+      "sourceType": "monitoring_alert",
+      "service": "checkout-api",
+      "region": "us-east",
+      "facts": {
+        "metric": "payment_authorization_failure_rate",
+        "threshold": 2,
+        "observedValue": 18
+      }
+    },
+    "expectedCandidateIds": [],
+    "expectedCorroboratingKinds": ["threshold_breach", "recent_deployment"],
+    "body": {
+      "model": "jev-1.13.0",
+      "answers": {
+        "priorityAssessment": {
+          "type": "choice",
+          "choice": "P1",
+          "confidence": 0.98,
+          "probabilities": { "P0": 0.01, "P1": 0.98, "P2": 0.01, "P3": 0 }
+        },
+        "customerReach": {
+          "type": "choice",
+          "choice": "widespread",
+          "confidence": 0.97,
+          "probabilities": {
+            "single": 0.01,
+            "subset": 0.02,
+            "widespread": 0.97,
+            "unknown": 0
+          }
+        },
+        "regionalReach": {
+          "type": "choice",
+          "choice": "single_region",
+          "confidence": 0.99,
+          "probabilities": {
+            "single_region": 0.99,
+            "multi_region": 0.005,
+            "global": 0.001,
+            "not_applicable": 0.001,
+            "unknown": 0.003
+          }
+        },
+        "serviceBreadth": {
+          "type": "choice",
+          "choice": "single_service",
+          "confidence": 0.96,
+          "probabilities": {
+            "single_service": 0.96,
+            "multi_service": 0.02,
+            "platform_wide": 0.01,
+            "unknown": 0.01
+          }
+        },
+        "primaryOwningDomain": {
+          "type": "choice",
+          "choice": "payments",
+          "confidence": 0.99,
+          "probabilities": {
+            "payments": 0.99,
+            "authentication": 0.0025,
+            "fulfillment": 0.0025,
+            "platform": 0.0025,
+            "unknown": 0.0025
+          }
+        },
+        "evidenceSufficiency": { "type": "noul", "noul": 0.99 }
+      },
+      "usage": { "input_tokens": 512, "output_tokens": 96 }
+    }
+  },
+  {
+    "requestId": "recorded:canonical-deployment-v1",
+    "expectedSignal": {
+      "sourceType": "deployment_event",
+      "service": "checkout-api",
+      "region": "us-east",
+      "facts": { "version": "2026.09.20.3", "outcome": "succeeded" }
+    },
+    "expectedCandidateIds": [],
+    "expectedCorroboratingKinds": [],
+    "body": {
+      "model": "jev-1.13.0",
+      "answers": {
+        "priorityAssessment": {
+          "type": "choice",
+          "choice": "P3",
+          "confidence": 0.97,
+          "probabilities": { "P0": 0.01, "P1": 0.01, "P2": 0.01, "P3": 0.97 }
+        },
+        "customerReach": {
+          "type": "choice",
+          "choice": "unknown",
+          "confidence": 0.95,
+          "probabilities": {
+            "single": 0.01,
+            "subset": 0.02,
+            "widespread": 0.02,
+            "unknown": 0.95
+          }
+        },
+        "regionalReach": {
+          "type": "choice",
+          "choice": "single_region",
+          "confidence": 0.97,
+          "probabilities": {
+            "single_region": 0.97,
+            "multi_region": 0.01,
+            "global": 0.01,
+            "not_applicable": 0.005,
+            "unknown": 0.005
+          }
+        },
+        "serviceBreadth": {
+          "type": "choice",
+          "choice": "single_service",
+          "confidence": 0.97,
+          "probabilities": {
+            "single_service": 0.97,
+            "multi_service": 0.01,
+            "platform_wide": 0.01,
+            "unknown": 0.01
+          }
+        },
+        "primaryOwningDomain": {
+          "type": "choice",
+          "choice": "payments",
+          "confidence": 0.97,
+          "probabilities": {
+            "payments": 0.97,
+            "authentication": 0.01,
+            "fulfillment": 0.01,
+            "platform": 0.005,
+            "unknown": 0.005
+          }
+        },
+        "evidenceSufficiency": { "type": "noul", "noul": 0.2 }
+      },
+      "usage": { "input_tokens": 480, "output_tokens": 75 }
+    }
+  }
+]

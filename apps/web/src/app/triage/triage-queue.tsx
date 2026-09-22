@@ -48,6 +48,7 @@ function formatReceiptTime(receivedAt: string): string {
 function statusLabel(status: TriageCase['status']): string {
   if (status === 'queued') return 'Queued';
   if (status === 'incident_created') return 'Incident created';
+  if (status === 'needs_review') return 'Needs review';
   return 'Ready for evaluation';
 }
 

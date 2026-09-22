@@ -1,4 +1,5 @@
 import { Button } from '#components/ui/button';
+import { Badge } from '#components/ui/badge';
 import { DecisionTrace } from '#components/decision-trace';
 import { Separator } from '#components/ui/separator';
 import { TriageCaseDetailSchema } from '@incident-command-center/contracts';
@@ -43,6 +44,20 @@ export default async function TriageCasePage({
           <p className="mt-2 text-sm text-muted-foreground">
             {detail.signal.service} · {detail.signal.region ?? 'Unknown region'}
           </p>
+          {detail.evaluation && (
+            <Badge
+              className="mt-3"
+              variant={
+                detail.evaluation.mode === 'live' ? 'default' : 'outline'
+              }
+            >
+              {detail.evaluation.mode === 'recorded'
+                ? 'Recorded fixture Evaluation'
+                : detail.evaluation.mode === 'live'
+                  ? 'Live Jev Evaluation'
+                  : 'Deterministic Evaluation'}
+            </Badge>
+          )}
         </div>
         {detail.incidentId && (
           <Button asChild variant="outline">
@@ -56,6 +71,7 @@ export default async function TriageCasePage({
       <DecisionTrace
         signal={detail.signal}
         evaluation={detail.evaluation}
+        reviewTask={detail.reviewTask}
         corroboratingFacts={detail.corroboratingFacts}
         policyDecision={detail.policyDecision}
         workflowActions={detail.workflowActions}

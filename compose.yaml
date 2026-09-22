@@ -42,6 +42,9 @@ services:
       ['npm', 'run', 'start', '--workspace', '@incident-command-center/worker']
     environment:
       DATABASE_URL: postgres://incident:incident@postgres:5432/incident_command_center
+      EVALUATION_MODE: ${EVALUATION_MODE:-live}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+      JEV_MODEL: ${JEV_MODEL:-jev-1.13.0}
     depends_on:
       postgres:
         condition: service_healthy

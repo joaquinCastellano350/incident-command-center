@@ -130,6 +130,7 @@ export const TriageCaseStatusSchema = z.enum([
   'queued',
   'ready_for_evaluation',
   'incident_created',
+  'needs_review',
 ]);
 
 export const TriageCaseSchema = z.object({
@@ -171,11 +172,84 @@ function choiceJudgmentSchema<
   const TValues extends readonly [string, ...string[]],
 >(values: TValues) {
   const outcome = z.enum(values);
-  return z.object({
-    choice: outcome,
-    probabilities: z.array(z.object({ outcome, probability })),
-  });
+  return z
+    .object({
+      choice: outcome,
+      confidence: probability.optional(),
+      probabilities: z
+        .array(z.object({ outcome, probability }))
+        .length(values.length),
+    })
+    .superRefine((judgment, context) => {
+      const outcomes = new Set(
+        judgment.probabilities.map((item) => item.outcome),
+      );
+      const total = judgment.probabilities.reduce(
+        (sum, item) => sum + item.probability,
+        0,
+      );
+      if (
+        outcomes.size !== values.length ||
+        values.some((value) => !outcomes.has(value)) ||
+        Math.abs(total - 1) > 0.02
+      ) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Choice requires a complete probability distribution',
+        });
+      }
+      const selected =
+        judgment.probabilities.find((item) => item.outcome === judgment.choice)
+          ?.probability ?? 0;
+      if (
+        judgment.probabilities.some(
+          (item) => item.probability > selected + 0.0001,
+        )
+      ) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Choice must have the highest probability',
+        });
+      }
+    });
 }
+
+export const IncidentMatchSchema = choiceJudgmentSchema([
+  'same_incident',
+  'related_distinct',
+  'unrelated',
+]);
+
+export const CandidateIncidentSchema = z.object({
+  id: z.uuid(),
+  title: z.string(),
+  service: z.string(),
+  region: z.string().nullable(),
+  status: z.enum(['open', 'acknowledged', 'mitigated', 'resolved']),
+  resolvedAt: z.iso.datetime().nullable().default(null),
+  currentPriority: z.enum(['P0', 'P1', 'P2', 'P3']),
+  primaryOwningDomain: z.enum([
+    'payments',
+    'authentication',
+    'fulfillment',
+    'platform',
+    'unknown',
+  ]),
+});
+export type CandidateIncident = z.infer<typeof CandidateIncidentSchema>;
+
+export const EvaluationInputSchema = z.object({
+  signal: SignalSchema,
+  corroboratingFacts: z.array(
+    z.object({
+      kind: z.string(),
+      summary: z.string(),
+      evidenceSignalIds: z.array(z.uuid()),
+    }),
+  ),
+  candidates: z.array(CandidateIncidentSchema).max(5),
+});
+export type EvaluationInput = z.infer<typeof EvaluationInputSchema>;
 
 export const OperationalJudgmentsSchema = z.object({
   priorityAssessment: choiceJudgmentSchema(['P0', 'P1', 'P2', 'P3']),
@@ -210,29 +284,78 @@ export const OperationalJudgmentsSchema = z.object({
 
 export type OperationalJudgments = z.infer<typeof OperationalJudgmentsSchema>;
 
-export const EvaluationSchema = z.object({
-  id: z.uuid(),
-  triageCaseId: z.uuid(),
-  previousEvaluationId: z.uuid().nullable(),
-  correlationId: z.uuid(),
-  status: z.literal('succeeded'),
-  configuredModel: z.string().min(1),
-  resolvedModel: z.string().min(1),
-  normalizationVersion: z.literal(1),
-  decisionSchemaVersion: z.literal('operational-judgments.v1'),
-  questionSetVersion: z.literal('northstar-triage.v1'),
-  policyVersion: z.literal('northstar-automation.v1'),
-  attemptId: z.uuid(),
-  providerRequestId: z.string(),
-  inputTokens: z.number().int().nonnegative(),
-  outputTokens: z.number().int().nonnegative(),
-  latencyMs: z.number().nonnegative(),
-  retryCount: z.number().int().nonnegative(),
-  evaluatedAt: z.iso.datetime(),
-  judgments: OperationalJudgmentsSchema,
-});
+export const EvaluationSchema = z
+  .object({
+    id: z.uuid(),
+    triageCaseId: z.uuid(),
+    previousEvaluationId: z.uuid().nullable(),
+    correlationId: z.uuid(),
+    status: z.enum(['succeeded', 'failed']),
+    mode: z
+      .enum(['live', 'recorded', 'deterministic'])
+      .default('deterministic'),
+    configuredModel: z.string().min(1),
+    resolvedModel: z.string().min(1),
+    normalizationVersion: z.literal(1),
+    decisionSchemaVersion: z.literal('operational-judgments.v1'),
+    questionSetVersion: z.literal('northstar-triage.v1'),
+    policyVersion: z.literal('northstar-automation.v1'),
+    attemptId: z.uuid(),
+    providerRequestId: z.string().nullable(),
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    latencyMs: z.number().nonnegative(),
+    retryCount: z.number().int().nonnegative(),
+    evaluatedAt: z.iso.datetime(),
+    judgments: OperationalJudgmentsSchema.nullable(),
+    incidentMatches: z
+      .array(
+        z.object({
+          candidateIncidentId: z.uuid(),
+          judgment: IncidentMatchSchema,
+        }),
+      )
+      .default([]),
+    failure: z
+      .object({
+        kind: z.enum(['deadline', 'provider', 'invalid_response']),
+        message: z.string(),
+      })
+      .nullable()
+      .default(null),
+  })
+  .superRefine((evaluation, context) => {
+    if (
+      evaluation.status === 'succeeded' &&
+      (!evaluation.judgments || evaluation.failure)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Successful Evaluation requires judgments and no failure',
+      });
+    }
+    if (
+      evaluation.status === 'failed' &&
+      (evaluation.judgments || !evaluation.failure)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Failed Evaluation requires a failure and no judgments',
+      });
+    }
+  });
 
 export type Evaluation = z.infer<typeof EvaluationSchema>;
+
+export const ReviewTaskSchema = z.object({
+  id: z.uuid(),
+  triageCaseId: z.uuid(),
+  correlationId: z.uuid(),
+  urgency: z.enum(['urgent', 'standard']),
+  reason: z.string(),
+  createdAt: z.iso.datetime(),
+});
+export type ReviewTask = z.infer<typeof ReviewTaskSchema>;
 
 export const CorroboratingFactSchema = z.object({
   id: z.uuid(),
@@ -299,20 +422,30 @@ export const WorkflowActionSchema = z.object({
 
 export type WorkflowAction = z.infer<typeof WorkflowActionSchema>;
 
-export const IncidentSchema = z.object({
-  id: z.uuid(),
-  title: z.string(),
-  status: z.literal('open'),
-  currentPriority: z.enum(['P0', 'P1', 'P2', 'P3']),
-  primaryOwningDomain: z.enum([
-    'payments',
-    'authentication',
-    'fulfillment',
-    'platform',
-  ]),
-  createdAt: z.iso.datetime(),
-  correlationId: z.uuid(),
-});
+export const IncidentSchema = z
+  .object({
+    id: z.uuid(),
+    title: z.string(),
+    status: z.enum(['open', 'acknowledged', 'mitigated', 'resolved']),
+    resolvedAt: z.iso.datetime().nullable().default(null),
+    currentPriority: z.enum(['P0', 'P1', 'P2', 'P3']),
+    primaryOwningDomain: z.enum([
+      'payments',
+      'authentication',
+      'fulfillment',
+      'platform',
+      'unknown',
+    ]),
+    createdAt: z.iso.datetime(),
+    correlationId: z.uuid(),
+  })
+  .refine(
+    (incident) => incident.status !== 'resolved' || !!incident.resolvedAt,
+    {
+      message: 'Resolved Incidents require resolvedAt',
+      path: ['resolvedAt'],
+    },
+  );
 
 export type Incident = z.infer<typeof IncidentSchema>;
 
@@ -330,6 +463,7 @@ export const TriageCaseDetailSchema = z.object({
   triageCase: TriageCaseSchema,
   signal: SignalSchema,
   evaluation: EvaluationSchema.nullable(),
+  reviewTask: ReviewTaskSchema.nullable(),
   corroboratingFacts: z.array(CorroboratingFactSchema),
   policyDecision: PolicyDecisionSchema.nullable(),
   workflowActions: z.array(WorkflowActionSchema),

@@ -1,5 +1,6 @@
 import type {
   MonitoringAlertInput,
+  DeploymentEventInput,
   OperationalJudgments,
   PolicyRuleResult,
   WorkflowActionType,
@@ -25,9 +26,20 @@ export interface PagingProviderPort<TPage = unknown> {
 
 export interface OperationalJudgmentResult<TJudgments> {
   judgments: TJudgments;
+  incidentMatches: Array<{
+    candidateIncidentId: string;
+    judgment: {
+      choice: 'same_incident' | 'related_distinct' | 'unrelated';
+      probabilities: Array<{
+        outcome: 'same_incident' | 'related_distinct' | 'unrelated';
+        probability: number;
+      }>;
+    };
+  }>;
+  mode: 'live' | 'recorded' | 'deterministic';
   configuredModel: string;
   resolvedModel: string;
-  providerRequestId: string;
+  providerRequestId: string | null;
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
@@ -53,7 +65,7 @@ function distribution<const TChoices extends readonly string[]>(
   };
 }
 
-const owningDomainByService = {
+export const NORTHSTAR_SERVICE_DOMAINS = {
   'checkout-api': 'payments',
   'payment-processor': 'payments',
   'identity-api': 'authentication',
@@ -72,10 +84,10 @@ export function evaluateMonitoringAlertDeterministically(
     signal.service === 'checkout-api' &&
     signal.observedValue >= 10;
   const owner:
-    | (typeof owningDomainByService)[keyof typeof owningDomainByService]
-    | 'unknown' = Object.hasOwn(owningDomainByService, signal.service)
-    ? owningDomainByService[
-        signal.service as keyof typeof owningDomainByService
+    | (typeof NORTHSTAR_SERVICE_DOMAINS)[keyof typeof NORTHSTAR_SERVICE_DOMAINS]
+    | 'unknown' = Object.hasOwn(NORTHSTAR_SERVICE_DOMAINS, signal.service)
+    ? NORTHSTAR_SERVICE_DOMAINS[
+        signal.service as keyof typeof NORTHSTAR_SERVICE_DOMAINS
       ]
     : 'unknown';
 
@@ -111,6 +123,40 @@ export function evaluateMonitoringAlertDeterministically(
   };
 }
 
+export function evaluateDeploymentEventDeterministically(
+  signal: DeploymentEventInput,
+): OperationalJudgments {
+  const owner = Object.hasOwn(NORTHSTAR_SERVICE_DOMAINS, signal.service)
+    ? NORTHSTAR_SERVICE_DOMAINS[
+        signal.service as keyof typeof NORTHSTAR_SERVICE_DOMAINS
+      ]
+    : 'unknown';
+  return {
+    priorityAssessment: distribution('P3', ['P0', 'P1', 'P2', 'P3'], 0.97),
+    customerReach: distribution(
+      'unknown',
+      ['single', 'subset', 'widespread', 'unknown'],
+      0.95,
+    ),
+    regionalReach: distribution(
+      'single_region',
+      ['single_region', 'multi_region', 'global', 'not_applicable', 'unknown'],
+      0.97,
+    ),
+    serviceBreadth: distribution(
+      'single_service',
+      ['single_service', 'multi_service', 'platform_wide', 'unknown'],
+      0.97,
+    ),
+    primaryOwningDomain: distribution(
+      owner,
+      ['payments', 'authentication', 'fulfillment', 'platform', 'unknown'],
+      owner === 'unknown' ? 0.5 : 0.97,
+    ),
+    evidenceSufficiency: { yesProbability: 0.2 },
+  };
+}
+
 export interface AutomationDecision {
   rules: PolicyRuleResult[];
   authorizedActions: WorkflowActionType[];
@@ -138,6 +184,7 @@ function selectedProbability(judgment: {
 export function decideAutomation(
   judgments: OperationalJudgments,
   hasCorroboratingFact: boolean,
+  noMatchConfirmed = true,
 ): AutomationDecision {
   const priority = judgments.priorityAssessment.choice;
   const owner = judgments.primaryOwningDomain.choice;
@@ -168,7 +215,8 @@ export function decideAutomation(
     confidentPriority &&
     sufficientEvidence &&
     knownImpact &&
-    confidentImpact;
+    confidentImpact &&
+    noMatchConfirmed;
   const assignOwner = createIncident && owner !== 'unknown' && confidentOwner;
   const pageOnCall =
     assignOwner &&
@@ -180,8 +228,8 @@ export function decideAutomation(
       action: 'create_incident',
       outcome: createIncident ? 'authorized' : 'denied',
       explanation: createIncident
-        ? 'Priority and impact Choice probabilities are at least 0.95, all impact dimensions are known, and Evidence Sufficiency is at least 0.95.'
-        : 'Incident creation requires non-minor priority at 0.95 probability, known impact dimensions at 0.95 probability, and Evidence Sufficiency of at least 0.95.',
+        ? 'Priority and impact Choice probabilities are at least 0.95, all impact dimensions are known, Evidence Sufficiency is at least 0.95, and no candidate Incident matches.'
+        : 'Incident creation requires non-minor priority at 0.95 probability, known impact dimensions at 0.95 probability, Evidence Sufficiency of at least 0.95, and confident no-match across candidate Incidents.',
     },
     {
       ruleId: 'assignment-known-primary-domain',

@@ -1,4 +1,5 @@
 import { Badge } from '#components/ui/badge';
+import { Alert, AlertDescription, AlertTitle } from '#components/ui/alert';
 import {
   Card,
   CardContent,
@@ -10,6 +11,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '#components/ui/tabs';
 import type {
   CorroboratingFact,
   Evaluation,
+  ReviewTask,
   PolicyDecision,
   Signal,
   TimelineEvent,
@@ -19,6 +21,7 @@ import type {
 interface DecisionTraceProperties {
   signal: Signal;
   evaluation: Evaluation | null;
+  reviewTask?: ReviewTask | null;
   corroboratingFacts: CorroboratingFact[];
   policyDecision: PolicyDecision | null;
   workflowActions: WorkflowAction[];
@@ -42,12 +45,13 @@ function facts(signal: Signal): Array<[string, string]> {
 export function DecisionTrace({
   signal,
   evaluation,
+  reviewTask,
   corroboratingFacts,
   policyDecision,
   workflowActions,
   timelineEvents,
 }: DecisionTraceProperties) {
-  const choiceJudgments = evaluation
+  const choiceJudgments = evaluation?.judgments
     ? ([
         ['Priority Assessment', evaluation.judgments.priorityAssessment],
         ['Customer Reach', evaluation.judgments.customerReach],
@@ -103,42 +107,131 @@ export function DecisionTrace({
       <TabsContent value="judgments" className="mt-4 space-y-4">
         {evaluation ? (
           <>
+            <Alert>
+              <AlertTitle className="flex items-center gap-2">
+                Evaluation{' '}
+                <Badge
+                  variant={evaluation.mode === 'live' ? 'default' : 'outline'}
+                >
+                  {label(evaluation.mode)} mode
+                </Badge>
+                <Badge
+                  variant={
+                    evaluation.status === 'failed' ? 'destructive' : 'secondary'
+                  }
+                >
+                  {label(evaluation.status)}
+                </Badge>
+              </AlertTitle>
+              <AlertDescription>
+                {evaluation.mode === 'recorded'
+                  ? 'Replayed response fixture; this is not a fresh Jev call.'
+                  : evaluation.mode === 'deterministic'
+                    ? 'Deterministic test Evaluation.'
+                    : 'Live Jev response.'}
+              </AlertDescription>
+            </Alert>
+            {evaluation.failure && (
+              <Alert variant="destructive">
+                <AlertTitle>Evaluation failed</AlertTitle>
+                <AlertDescription>
+                  {evaluation.failure.kind}: {evaluation.failure.message}
+                </AlertDescription>
+              </Alert>
+            )}
+            {reviewTask && (
+              <Alert>
+                <AlertTitle>
+                  Review Task · {label(reviewTask.urgency)}
+                </AlertTitle>
+                <AlertDescription>{reviewTask.reason}</AlertDescription>
+              </Alert>
+            )}
             <Card>
               <CardHeader>
                 <CardTitle>Operational Judgments</CardTitle>
                 <CardDescription>
-                  {evaluation.resolvedModel} · {evaluation.questionSetVersion}
+                  {evaluation.resolvedModel} · {evaluation.questionSetVersion} ·{' '}
+                  {evaluation.latencyMs.toFixed(0)} ms · {evaluation.retryCount}{' '}
+                  retries
                 </CardDescription>
               </CardHeader>
               <CardContent className="grid gap-4 md:grid-cols-2">
                 {choiceJudgments.map(([judgmentLabel, judgment]) => (
-                  <div key={judgmentLabel} className="rounded-md border p-4">
-                    <p className="text-xs text-muted-foreground">
-                      {judgmentLabel}
-                    </p>
-                    <p className="mt-1 font-medium">{label(judgment.choice)}</p>
-                    <p className="mt-2 text-xs text-muted-foreground">
-                      {judgment.probabilities
-                        .map(
-                          (item) =>
-                            `${label(item.outcome)} ${(item.probability * 100).toFixed(0)}%`,
-                        )
-                        .join(' · ')}
-                    </p>
-                  </div>
+                  <ChoiceAnswer
+                    key={judgmentLabel}
+                    title={judgmentLabel}
+                    judgment={judgment}
+                  />
                 ))}
-                <div className="rounded-md border p-4">
-                  <p className="text-xs text-muted-foreground">
-                    Evidence Sufficiency
-                  </p>
-                  <p className="mt-1 font-medium">
-                    {(
-                      evaluation.judgments.evidenceSufficiency.yesProbability *
-                      100
-                    ).toFixed(0)}
-                    % yes
-                  </p>
-                </div>
+                {evaluation.judgments && (
+                  <Card size="sm">
+                    <CardContent>
+                      <p className="text-xs text-muted-foreground">
+                        Evidence Sufficiency
+                      </p>
+                      <p className="mt-1 font-medium">
+                        {
+                          evaluation.judgments.evidenceSufficiency
+                            .yesProbability
+                        }{' '}
+                        yes probability
+                      </p>
+                    </CardContent>
+                  </Card>
+                )}
+                {evaluation.incidentMatches.map((match) => (
+                  <ChoiceAnswer
+                    key={match.candidateIncidentId}
+                    title={`Incident Match · ${match.candidateIncidentId}`}
+                    judgment={match.judgment}
+                  />
+                ))}
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>Evaluation audit</CardTitle>
+                <CardDescription>
+                  Provider and version details for this immutable result
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <Detail label="Attempt ID" value={evaluation.attemptId} />
+                <Detail
+                  label="Provider request ID"
+                  value={evaluation.providerRequestId ?? 'Unavailable'}
+                />
+                <Detail
+                  label="Configured model"
+                  value={evaluation.configuredModel}
+                />
+                <Detail
+                  label="Returned model"
+                  value={evaluation.resolvedModel}
+                />
+                <Detail
+                  label="Decision schema"
+                  value={evaluation.decisionSchemaVersion}
+                />
+                <Detail
+                  label="Question set"
+                  value={evaluation.questionSetVersion}
+                />
+                <Detail
+                  label="Input tokens"
+                  value={String(evaluation.inputTokens)}
+                />
+                <Detail
+                  label="Output tokens"
+                  value={String(evaluation.outputTokens)}
+                />
+                <Detail
+                  label="Local latency"
+                  value={`${evaluation.latencyMs.toFixed(0)} ms`}
+                />
+                <Detail label="Retries" value={String(evaluation.retryCount)} />
+                <Detail label="Evaluated at" value={evaluation.evaluatedAt} />
               </CardContent>
             </Card>
             <Card>
@@ -304,5 +397,39 @@ function Detail({ label, value }: { label: string; value: string }) {
       <p className="text-xs text-muted-foreground">{label}</p>
       <p className="mt-1 break-words text-sm font-medium">{value}</p>
     </div>
+  );
+}
+
+function ChoiceAnswer({
+  title,
+  judgment,
+}: {
+  title: string;
+  judgment: {
+    choice: string;
+    confidence?: number | undefined;
+    probabilities: Array<{ outcome: string; probability: number }>;
+  };
+}) {
+  return (
+    <Card size="sm">
+      <CardContent>
+        <p className="text-xs text-muted-foreground">{title}</p>
+        <p className="mt-1 font-medium">{label(judgment.choice)}</p>
+        {judgment.confidence !== undefined && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Choice confidence {judgment.confidence}
+          </p>
+        )}
+        <p className="mt-2 text-xs text-muted-foreground">
+          {judgment.probabilities
+            .map(
+              (item) =>
+                `${label(item.outcome)} ${item.probability} (${(item.probability * 100).toFixed(2)}%)`,
+            )
+            .join(' · ')}
+        </p>
+      </CardContent>
+    </Card>
   );
 }

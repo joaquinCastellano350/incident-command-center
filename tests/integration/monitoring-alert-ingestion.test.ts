@@ -340,7 +340,7 @@ describeWithPostgres('Monitoring Alert ingestion', () => {
           },
           { timeout: 15_000, interval: 100 },
         )
-        .toBe('ready_for_evaluation');
+        .toBe('needs_review');
     } finally {
       await worker.stop();
     }
@@ -391,7 +391,7 @@ describeWithPostgres('Monitoring Alert ingestion', () => {
             const updated = queue.items.find(
               (triageCase) => triageCase.id === accepted.triageCase.id,
             );
-            if (updated?.status === 'ready_for_evaluation') return queue;
+            if (updated?.status === 'needs_review') return queue;
           }
         })(),
         new Promise<never>((_resolve, reject) =>
@@ -404,7 +404,7 @@ describeWithPostgres('Monitoring Alert ingestion', () => {
 
       expect(updatedQueue.items).toContainEqual({
         ...accepted.triageCase,
-        status: 'ready_for_evaluation',
+        status: 'needs_review',
       });
     } finally {
       abort.abort();

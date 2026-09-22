@@ -11,6 +11,7 @@ import {
   DeploymentEventIngestionResultSchema,
   CorroboratingFactSchema,
   EvaluationSchema,
+  ReviewTaskSchema,
   HealthCheckJobSchema,
   HealthCheckMessageV1Schema,
   IncidentDetailSchema,
@@ -31,6 +32,7 @@ import {
   type DeploymentEventInput,
   type CorroboratingFact,
   type Evaluation,
+  type EvaluationInput,
   type Incident,
   type IncidentDetail,
   type MonitoringAlertIngestionResult,
@@ -47,7 +49,9 @@ import {
 } from '@incident-command-center/contracts';
 import {
   decideAutomation,
+  evaluateDeploymentEventDeterministically,
   evaluateMonitoringAlertDeterministically,
+  NORTHSTAR_SERVICE_DOMAINS,
   type Clock,
   type OperationalJudgmentProviderPort,
   type OperationalJudgmentResult,
@@ -56,11 +60,22 @@ import {
 import type { Pool, PoolClient } from 'pg';
 import { Pool as PostgresPool } from 'pg';
 import { PgBoss, type Db } from 'pg-boss';
+import { JevEvaluationFailure, JEV_QUESTION_SET_VERSION } from './jev.js';
+
+export {
+  buildJevRequest,
+  JevOperationalJudgmentProvider,
+  LiveJevTransport,
+  RecordedJevTransport,
+  JEV_MODEL,
+  JEV_QUESTION_SET_VERSION,
+} from './jev.js';
 
 export const HEALTH_CHECK_QUEUE = 'system-health-check';
 export const TRIAGE_QUEUE = 'triage-case-processing';
 const WORKER_READY_WINDOW_MS = 15_000;
 const APPLICATION_SCHEMA_LOCK = 740_219_350;
+const TRIAGE_MATCH_LOCK = 740_219_351;
 
 interface HealthJobRow {
   id: string;
@@ -93,7 +108,8 @@ interface SignalRow {
 interface TriageCaseRow {
   id: string;
   signal_id: string;
-  status: 'queued' | 'ready_for_evaluation' | 'incident_created';
+  status:
+    'queued' | 'ready_for_evaluation' | 'incident_created' | 'needs_review';
   source_reference: string;
   service: string;
   region: string | null;
@@ -117,6 +133,7 @@ interface NormalizedSignalDraft {
 }
 
 const schemaSql = `
+  CREATE EXTENSION IF NOT EXISTS pg_trgm;
   CREATE TABLE IF NOT EXISTS health_check_jobs (
     id uuid PRIMARY KEY,
     status text NOT NULL CHECK (status IN ('queued', 'completed')),
@@ -168,11 +185,17 @@ const schemaSql = `
     CHECK (source_type IN ('monitoring_alert', 'deployment_event'));
   ALTER TABLE triage_cases DROP CONSTRAINT IF EXISTS triage_cases_status_check;
   ALTER TABLE triage_cases ADD CONSTRAINT triage_cases_status_check
-    CHECK (status IN ('queued', 'ready_for_evaluation', 'incident_created'));
+    CHECK (status IN ('queued', 'ready_for_evaluation', 'incident_created', 'needs_review'));
 
   CREATE TABLE IF NOT EXISTS evaluations (
     id uuid PRIMARY KEY,
     triage_case_id uuid NOT NULL REFERENCES triage_cases(id),
+    record jsonb NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS review_tasks (
+    id uuid PRIMARY KEY,
+    triage_case_id uuid NOT NULL UNIQUE REFERENCES triage_cases(id),
     record jsonb NOT NULL
   );
 
@@ -711,6 +734,7 @@ export class PostgresTriageSystem implements TriageSystem {
     const [
       signalResult,
       evaluationResult,
+      reviewResult,
       factResult,
       policyResult,
       actionResult,
@@ -723,6 +747,10 @@ export class PostgresTriageSystem implements TriageSystem {
       this.pool.query<{ record: unknown }>(
         `SELECT record FROM evaluations WHERE triage_case_id = $1
            ORDER BY record->>'evaluatedAt' DESC LIMIT 1`,
+        [id],
+      ),
+      this.pool.query<{ record: unknown }>(
+        'SELECT record FROM review_tasks WHERE triage_case_id = $1',
         [id],
       ),
       this.pool.query<{ record: unknown }>(
@@ -757,6 +785,7 @@ export class PostgresTriageSystem implements TriageSystem {
       triageCase: mapTriageCase(triageRow),
       signal: mapSignal(signalResult.rows[0]!),
       evaluation: evaluationResult.rows[0]?.record ?? null,
+      reviewTask: reviewResult.rows[0]?.record ?? null,
       corroboratingFacts: factResult.rows.map((row) => row.record),
       policyDecision: policyResult.rows[0]?.record ?? null,
       workflowActions: actionResult.rows.map((row) => row.record),
@@ -841,15 +870,52 @@ class SimulatedPagingProvider implements PagingProviderPort<PageRequest> {
   }
 }
 
-class DeterministicOperationalJudgmentProvider implements OperationalJudgmentProviderPort<
-  MonitoringAlertInput,
+export class DeterministicOperationalJudgmentProvider implements OperationalJudgmentProviderPort<
+  EvaluationInput,
   OperationalJudgments
 > {
   async evaluate(
-    signal: MonitoringAlertInput,
+    input: EvaluationInput,
   ): Promise<OperationalJudgmentResult<OperationalJudgments>> {
+    const signal = input.signal;
     return {
-      judgments: evaluateMonitoringAlertDeterministically(signal),
+      judgments:
+        signal.sourceType === 'monitoring_alert'
+          ? evaluateMonitoringAlertDeterministically({
+              provider: signal.provider,
+              sourceEventKey: signal.sourceEventKey,
+              sourceReference: signal.sourceReference,
+              service: signal.service,
+              region: signal.region as MonitoringAlertInput['region'],
+              occurredAt: signal.occurredAt,
+              ...signal.facts,
+              ...(signal.environment
+                ? { environment: signal.environment }
+                : {}),
+              ...(signal.title ? { title: signal.title } : {}),
+              ...(signal.content ? { content: signal.content } : {}),
+            })
+          : evaluateDeploymentEventDeterministically({
+              provider: signal.provider,
+              sourceEventKey: signal.sourceEventKey,
+              sourceReference: signal.sourceReference,
+              service: signal.service,
+              region: signal.region as DeploymentEventInput['region'],
+              occurredAt: signal.occurredAt,
+              ...signal.facts,
+            }),
+      incidentMatches: input.candidates.map((candidate) => ({
+        candidateIncidentId: candidate.id,
+        judgment: {
+          choice: 'unrelated' as const,
+          probabilities: [
+            { outcome: 'same_incident' as const, probability: 0.01 },
+            { outcome: 'related_distinct' as const, probability: 0.01 },
+            { outcome: 'unrelated' as const, probability: 0.98 },
+          ],
+        },
+      })),
+      mode: 'deterministic',
       configuredModel: 'deterministic-canonical-v1',
       resolvedModel: 'deterministic-canonical-v1',
       providerRequestId: `deterministic:${signal.sourceEventKey}`,
@@ -868,7 +934,7 @@ export class PgBossTriageWorker {
     private readonly clock: Clock,
     private readonly pagingProvider: PagingProviderPort<PageRequest>,
     private readonly judgmentProvider: OperationalJudgmentProviderPort<
-      MonitoringAlertInput,
+      EvaluationInput,
       OperationalJudgments
     >,
   ) {}
@@ -893,79 +959,154 @@ export class PgBossTriageWorker {
     if (!signalRow) throw new Error('Signal for Triage Case was not found');
     const signal = mapSignal(signalRow);
 
+    await transaction.executeSql('SELECT pg_advisory_xact_lock($1)', [
+      TRIAGE_MATCH_LOCK,
+    ]);
+
     const completedResult = await transaction.executeSql(
-      'SELECT 1 FROM policy_decisions WHERE triage_case_id = $1 LIMIT 1',
+      `SELECT 1 FROM policy_decisions WHERE triage_case_id = $1
+       UNION ALL SELECT 1 FROM review_tasks WHERE triage_case_id = $1 LIMIT 1`,
       [message.triageCaseId],
     );
     if (completedResult.rows.length > 0) return;
 
-    if (signal.sourceType === 'deployment_event') {
+    const occurredAt = new Date(signal.occurredAt);
+    const corroboratingFacts: CorroboratingFact[] = [];
+    if (signal.sourceType === 'monitoring_alert') {
+      const recentDeploymentResult = await transaction.executeSql(
+        `SELECT id FROM signals
+         WHERE source_type = 'deployment_event'
+           AND service = $1 AND region = $2
+           AND facts->>'outcome' = 'succeeded'
+           AND occurred_at <= $3
+           AND occurred_at >= $3::timestamptz - interval '15 minutes'
+         ORDER BY occurred_at DESC LIMIT 1`,
+        [signal.service, signal.region, occurredAt],
+      );
+      if (signal.facts.observedValue > signal.facts.threshold) {
+        corroboratingFacts.push(
+          CorroboratingFactSchema.parse({
+            id: randomUUID(),
+            kind: 'threshold_breach',
+            summary: `${signal.facts.metric} measured ${signal.facts.observedValue} against threshold ${signal.facts.threshold}.`,
+            evidenceSignalIds: [signal.id],
+          }),
+        );
+        const recentDeployment = recentDeploymentResult.rows[0] as
+          { id: string } | undefined;
+        if (recentDeployment) {
+          corroboratingFacts.push(
+            CorroboratingFactSchema.parse({
+              id: randomUUID(),
+              kind: 'recent_deployment',
+              summary:
+                'A successful deployment for the same service and region completed within 15 minutes.',
+              evidenceSignalIds: [recentDeployment.id],
+            }),
+          );
+        }
+      }
+    }
+
+    const searchText = [signal.title, signal.content, signal.sourceReference]
+      .filter(Boolean)
+      .join(' ');
+    const knownDomain = Object.hasOwn(NORTHSTAR_SERVICE_DOMAINS, signal.service)
+      ? NORTHSTAR_SERVICE_DOMAINS[
+          signal.service as keyof typeof NORTHSTAR_SERVICE_DOMAINS
+        ]
+      : null;
+    const candidateResult = await transaction.executeSql(
+      `SELECT i.record, s.service, s.region FROM incidents i
+       JOIN triage_cases t ON t.id = i.triage_case_id
+       JOIN signals s ON s.id = t.signal_id
+       WHERE i.record->>'status' <> 'resolved'
+          OR (i.record->>'resolvedAt')::timestamptz >= $3::timestamptz - interval '24 hours'
+       ORDER BY
+         (CASE WHEN position(i.id::text in $4) > 0 THEN 100 ELSE 0 END
+          + CASE WHEN s.service = $1 THEN 20 ELSE 0 END
+          + CASE WHEN s.region = $2 THEN 10 ELSE 0 END
+          + CASE WHEN i.record->>'primaryOwningDomain' = $5 THEN 8 ELSE 0 END
+          + 10 * ts_rank(to_tsvector('english', coalesce(i.record->>'title', '')),
+                         websearch_to_tsquery('english', $4))
+          + 5 * similarity(coalesce(i.record->>'title', ''), $4)) DESC,
+         (i.record->>'createdAt') DESC
+       LIMIT 5`,
+      [signal.service, signal.region, occurredAt, searchText, knownDomain],
+    );
+    const candidates = candidateResult.rows.map((row) => {
+      const candidate = row as {
+        record: Incident;
+        service: string;
+        region: string | null;
+      };
+      return {
+        id: candidate.record.id,
+        title: candidate.record.title,
+        status: candidate.record.status,
+        resolvedAt: candidate.record.resolvedAt,
+        currentPriority: candidate.record.currentPriority,
+        primaryOwningDomain: candidate.record.primaryOwningDomain,
+        service: candidate.service,
+        region: candidate.region,
+      };
+    });
+    let judgmentResult: OperationalJudgmentResult<OperationalJudgments>;
+    try {
+      judgmentResult = await this.judgmentProvider.evaluate({
+        signal,
+        corroboratingFacts: corroboratingFacts.map(
+          ({ kind, summary, evidenceSignalIds }) => ({
+            kind,
+            summary,
+            evidenceSignalIds,
+          }),
+        ),
+        candidates,
+      });
+    } catch (error) {
+      if (!(error instanceof JevEvaluationFailure)) throw error;
+      const evaluatedAt = this.clock.now().toISOString();
+      const evaluation = EvaluationSchema.parse({
+        id: randomUUID(),
+        triageCaseId: message.triageCaseId,
+        previousEvaluationId: null,
+        correlationId: message.correlationId,
+        status: 'failed',
+        ...error.metadata,
+        normalizationVersion: 1,
+        decisionSchemaVersion: 'operational-judgments.v1',
+        questionSetVersion: JEV_QUESTION_SET_VERSION,
+        policyVersion: 'northstar-automation.v1',
+        attemptId: randomUUID(),
+        evaluatedAt,
+        judgments: null,
+        incidentMatches: [],
+        failure: { kind: error.kind, message: error.message },
+      });
+      const reviewTask = ReviewTaskSchema.parse({
+        id: randomUUID(),
+        triageCaseId: message.triageCaseId,
+        correlationId: message.correlationId,
+        urgency: 'urgent',
+        reason: `Evaluation failed: ${error.message}`,
+        createdAt: evaluatedAt,
+      });
       await transaction.executeSql(
-        `UPDATE triage_cases
-         SET status = 'ready_for_evaluation'
-         WHERE id = $1 AND signal_id = $2`,
-        [message.triageCaseId, message.signalId],
+        'INSERT INTO evaluations (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)',
+        [evaluation.id, message.triageCaseId, JSON.stringify(evaluation)],
+      );
+      await transaction.executeSql(
+        'INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb) ON CONFLICT (triage_case_id) DO NOTHING',
+        [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
+      );
+      await transaction.executeSql(
+        "UPDATE triage_cases SET status = 'needs_review' WHERE id = $1",
+        [message.triageCaseId],
       );
       return;
     }
-
-    const judgmentResult = await this.judgmentProvider.evaluate({
-      provider: signal.provider,
-      sourceEventKey: signal.sourceEventKey,
-      sourceReference: signal.sourceReference,
-      metric: signal.facts.metric,
-      threshold: signal.facts.threshold,
-      observedValue: signal.facts.observedValue,
-      service: signal.service,
-      region: signal.region as 'us-east' | 'eu-west' | 'sa-east',
-      occurredAt: signal.occurredAt,
-      evaluationWindowSeconds: signal.facts.evaluationWindowSeconds,
-      ...(signal.environment ? { environment: signal.environment } : {}),
-      ...(signal.title ? { title: signal.title } : {}),
-      ...(signal.content ? { content: signal.content } : {}),
-      ...(signal.rawFixtureReference
-        ? { rawFixtureReference: signal.rawFixtureReference }
-        : {}),
-    });
     const { judgments } = judgmentResult;
-    const occurredAt = new Date(signal.occurredAt);
-    const recentDeploymentResult = await transaction.executeSql(
-      `SELECT id FROM signals
-       WHERE source_type = 'deployment_event'
-         AND service = $1 AND region = $2
-         AND facts->>'outcome' = 'succeeded'
-         AND occurred_at <= $3
-         AND occurred_at >= $3::timestamptz - interval '15 minutes'
-       ORDER BY occurred_at DESC
-       LIMIT 1`,
-      [signal.service, signal.region, occurredAt],
-    );
-    const corroboratingFacts: CorroboratingFact[] = [];
-    if (signal.facts.observedValue > signal.facts.threshold) {
-      corroboratingFacts.push(
-        CorroboratingFactSchema.parse({
-          id: randomUUID(),
-          kind: 'threshold_breach',
-          summary: `${signal.facts.metric} measured ${signal.facts.observedValue} against threshold ${signal.facts.threshold}.`,
-          evidenceSignalIds: [signal.id],
-        }),
-      );
-    }
-    const recentDeployment = recentDeploymentResult.rows[0] as
-      { id: string } | undefined;
-    const thresholdBreached =
-      signal.facts.observedValue > signal.facts.threshold;
-    if (recentDeployment && thresholdBreached) {
-      corroboratingFacts.push(
-        CorroboratingFactSchema.parse({
-          id: randomUUID(),
-          kind: 'recent_deployment',
-          summary:
-            'A successful deployment for the same service and region completed within 15 minutes.',
-          evidenceSignalIds: [recentDeployment.id],
-        }),
-      );
-    }
 
     const evaluatedAt = this.clock.now().toISOString();
     const evaluation = EvaluationSchema.parse({
@@ -974,11 +1115,12 @@ export class PgBossTriageWorker {
       previousEvaluationId: null,
       correlationId: message.correlationId,
       status: 'succeeded',
+      mode: judgmentResult.mode,
       configuredModel: judgmentResult.configuredModel,
       resolvedModel: judgmentResult.resolvedModel,
       normalizationVersion: 1,
       decisionSchemaVersion: 'operational-judgments.v1',
-      questionSetVersion: 'northstar-triage.v1',
+      questionSetVersion: JEV_QUESTION_SET_VERSION,
       policyVersion: 'northstar-automation.v1',
       attemptId: randomUUID(),
       providerRequestId: judgmentResult.providerRequestId,
@@ -988,10 +1130,16 @@ export class PgBossTriageWorker {
       retryCount: judgmentResult.retryCount,
       evaluatedAt,
       judgments,
+      incidentMatches: judgmentResult.incidentMatches,
+      failure: null,
     });
+    // Until a match threshold is selected from the held-out benchmark, any
+    // retrieved candidate requires an Operator to review the relationship.
+    const noMatchConfirmed = candidates.length === 0;
     const automation = decideAutomation(
       judgments,
       corroboratingFacts.length > 0,
+      noMatchConfirmed,
     );
     const policyDecision = PolicyDecisionSchema.parse({
       id: randomUUID(),
@@ -1022,8 +1170,24 @@ export class PgBossTriageWorker {
     );
 
     if (!automation.authorizedActions.includes('create_incident')) {
+      const reviewTask = ReviewTaskSchema.parse({
+        id: randomUUID(),
+        triageCaseId: message.triageCaseId,
+        correlationId: message.correlationId,
+        urgency: ['P0', 'P1'].includes(judgments.priorityAssessment.choice)
+          ? 'urgent'
+          : 'standard',
+        reason: noMatchConfirmed
+          ? 'Operational Judgments did not meet Incident creation policy.'
+          : 'A candidate Incident may match; an Operator must review the relationship.',
+        createdAt: evaluatedAt,
+      });
       await transaction.executeSql(
-        `UPDATE triage_cases SET status = 'ready_for_evaluation'
+        'INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb) ON CONFLICT (triage_case_id) DO NOTHING',
+        [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
+      );
+      await transaction.executeSql(
+        `UPDATE triage_cases SET status = 'needs_review'
          WHERE id = $1 AND signal_id = $2`,
         [message.triageCaseId, message.signalId],
       );
@@ -1089,6 +1253,24 @@ export class PgBossTriageWorker {
         'on_call_paged',
         `${incident.primaryOwningDomain} On-call Engineer paged.`,
         evaluatedAt,
+      );
+    }
+
+    if (incident.primaryOwningDomain === 'unknown') {
+      const reviewTask = ReviewTaskSchema.parse({
+        id: randomUUID(),
+        triageCaseId: message.triageCaseId,
+        correlationId: message.correlationId,
+        urgency: ['P0', 'P1'].includes(incident.currentPriority)
+          ? 'urgent'
+          : 'standard',
+        reason:
+          'Primary Owning Domain is unknown; assignment requires Operator review.',
+        createdAt: evaluatedAt,
+      });
+      await transaction.executeSql(
+        'INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb) ON CONFLICT (triage_case_id) DO NOTHING',
+        [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
       );
     }
 
@@ -1176,7 +1358,7 @@ interface TriageWorkerRuntimeOptions {
   clock?: Clock;
   pagingProvider?: PagingProviderPort<PageRequest>;
   judgmentProvider?: OperationalJudgmentProviderPort<
-    MonitoringAlertInput,
+    EvaluationInput,
     OperationalJudgments
   >;
 }
