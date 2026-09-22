@@ -11,3 +11,7 @@ Use the canonical labels `needs-triage`, `needs-info`, `ready-for-agent`, `ready
 ### Domain docs
 
 This is a single-context repository with `CONTEXT.md` and `docs/adr/` at the root. See `docs/agents/domain.md`.
+
+### UI implementation
+
+For every user-facing component, screen, or visual-system change, use the shadcn registry workflow and the project UI rules in `docs/agents/ui.md`.

@@ -25,3 +25,4 @@ These records explain durable or non-obvious choices behind the authoritative [p
 21. [Use REST commands and Server-Sent Events](./0021-use-rest-commands-and-server-sent-events.md)
 22. [Keep generated assistant content out of Incident truth](./0022-keep-generated-assistant-content-out-of-incident-truth.md)
 23. [Run demo scenarios through provider adapters](./0023-run-demo-scenarios-through-provider-adapters.md)
+24. [Standardize application UI on shadcn/ui](./0024-standardize-application-ui-on-shadcn.md)
