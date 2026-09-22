@@ -8,9 +8,13 @@ import type {
 import {
   HealthCheckJobSchema,
   HealthStatusSchema,
+  DeploymentEventInputSchema,
+  DeploymentEventIngestionResultSchema,
+  IncidentDetailSchema,
   MonitoringAlertInputSchema,
   MonitoringAlertIngestionResultSchema,
   TriageQueueSchema,
+  TriageCaseDetailSchema,
 } from '@incident-command-center/contracts';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
@@ -88,6 +92,26 @@ export async function buildApi({
   });
 
   if (triageSystem) {
+    app.post('/api/v1/signals/deployment-events', async (request, reply) => {
+      const input = DeploymentEventInputSchema.safeParse(request.body);
+      if (!input.success) {
+        return reply.code(400).send({
+          error: 'Invalid Deployment Event',
+          issues: input.error.issues,
+        });
+      }
+
+      const correlationId = z.uuid().parse(request.id);
+      const result = DeploymentEventIngestionResultSchema.parse(
+        await triageSystem.ingestDeploymentEvent(input.data, correlationId),
+      );
+
+      return reply
+        .header('location', `/api/v1/triage-cases/${result.triageCase.id}`)
+        .code(result.deduplicated ? 200 : 202)
+        .send(result);
+    });
+
     app.post('/api/v1/signals/monitoring-alerts', async (request, reply) => {
       const input = MonitoringAlertInputSchema.safeParse(request.body);
       if (!input.success) {
@@ -114,6 +138,32 @@ export async function buildApi({
           items: await triageSystem.listTriageCases(),
         }),
       );
+    });
+
+    app.get('/api/v1/triage-cases/:id', async (request, reply) => {
+      const parameters = JobParametersSchema.safeParse(request.params);
+      if (!parameters.success) {
+        return reply
+          .code(400)
+          .send({ error: 'Invalid Triage Case identifier' });
+      }
+      const detail = await triageSystem.findTriageCase(parameters.data.id);
+      if (!detail) {
+        return reply.code(404).send({ error: 'Triage Case not found' });
+      }
+      return reply.send(TriageCaseDetailSchema.parse(detail));
+    });
+
+    app.get('/api/v1/incidents/:id', async (request, reply) => {
+      const parameters = JobParametersSchema.safeParse(request.params);
+      if (!parameters.success) {
+        return reply.code(400).send({ error: 'Invalid Incident identifier' });
+      }
+      const detail = await triageSystem.findIncident(parameters.data.id);
+      if (!detail) {
+        return reply.code(404).send({ error: 'Incident not found' });
+      }
+      return reply.send(IncidentDetailSchema.parse(detail));
     });
 
     app.get('/api/v1/triage-cases/events', async (request, reply) => {

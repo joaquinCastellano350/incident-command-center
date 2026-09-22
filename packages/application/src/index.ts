@@ -2,9 +2,13 @@ import type {
   HealthCheckJob,
   HealthCheckMessageV1,
   HealthStatus,
+  IncidentDetail,
+  DeploymentEventIngestionResult,
+  DeploymentEventInput,
   MonitoringAlertIngestionResult,
   MonitoringAlertInput,
   TriageCase,
+  TriageCaseDetail,
   TriageJobMessageV1,
 } from '@incident-command-center/contracts';
 
@@ -39,7 +43,13 @@ export interface TriageSystem {
     input: MonitoringAlertInput,
     correlationId: string,
   ): Promise<MonitoringAlertIngestionResult>;
+  ingestDeploymentEvent(
+    input: DeploymentEventInput,
+    correlationId: string,
+  ): Promise<DeploymentEventIngestionResult>;
   listTriageCases(): Promise<TriageCase[]>;
+  findTriageCase(id: string): Promise<TriageCaseDetail | null>;
+  findIncident(id: string): Promise<IncidentDetail | null>;
 }
 
 export interface TriageJobQueue {

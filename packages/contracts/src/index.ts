@@ -57,6 +57,27 @@ export const MonitoringAlertInputSchema = z
 
 export type MonitoringAlertInput = z.infer<typeof MonitoringAlertInputSchema>;
 
+export const DeploymentEventInputSchema = z
+  .object({
+    provider: z.string().trim().min(1),
+    sourceEventKey: z.string().trim().min(1),
+    sourceReference: z.string().trim().min(1),
+    service: z.string().trim().min(1),
+    region: z.enum(['us-east', 'eu-west', 'sa-east']),
+    version: z.string().trim().min(1),
+    commitReference: z.string().trim().min(1),
+    deployer: z.string().trim().min(1),
+    outcome: z.enum(['succeeded', 'failed', 'rolled_back']),
+    occurredAt: z.iso.datetime(),
+    environment: z.string().trim().min(1).optional(),
+    title: z.string().trim().min(1).optional(),
+    content: z.string().trim().min(1).optional(),
+    rawFixtureReference: z.string().trim().min(1).optional(),
+  })
+  .strict();
+
+export type DeploymentEventInput = z.infer<typeof DeploymentEventInputSchema>;
+
 export const MonitoringAlertFactsSchema = z.object({
   metric: z.string(),
   threshold: z.number(),
@@ -64,9 +85,15 @@ export const MonitoringAlertFactsSchema = z.object({
   evaluationWindowSeconds: z.number().int().positive(),
 });
 
-export const SignalSchema = z.object({
+export const DeploymentEventFactsSchema = z.object({
+  version: z.string(),
+  commitReference: z.string(),
+  deployer: z.string(),
+  outcome: z.enum(['succeeded', 'failed', 'rolled_back']),
+});
+
+const SignalEnvelopeSchema = z.object({
   id: z.uuid(),
-  sourceType: z.literal('monitoring_alert'),
   provider: z.string(),
   sourceEventKey: z.string(),
   sourceReference: z.string(),
@@ -77,17 +104,32 @@ export const SignalSchema = z.object({
   region: z.string().nullable(),
   title: z.string().nullable(),
   content: z.string().nullable(),
-  facts: MonitoringAlertFactsSchema,
   normalizationVersion: z.literal(1),
   rawFixtureReference: z.string().nullable(),
   correlationId: z.uuid(),
 });
+
+export const MonitoringAlertSignalSchema = SignalEnvelopeSchema.extend({
+  sourceType: z.literal('monitoring_alert'),
+  facts: MonitoringAlertFactsSchema,
+});
+
+export const DeploymentEventSignalSchema = SignalEnvelopeSchema.extend({
+  sourceType: z.literal('deployment_event'),
+  facts: DeploymentEventFactsSchema,
+});
+
+export const SignalSchema = z.discriminatedUnion('sourceType', [
+  MonitoringAlertSignalSchema,
+  DeploymentEventSignalSchema,
+]);
 
 export type Signal = z.infer<typeof SignalSchema>;
 
 export const TriageCaseStatusSchema = z.enum([
   'queued',
   'ready_for_evaluation',
+  'incident_created',
 ]);
 
 export const TriageCaseSchema = z.object({
@@ -104,7 +146,7 @@ export const TriageCaseSchema = z.object({
 export type TriageCase = z.infer<typeof TriageCaseSchema>;
 
 export const MonitoringAlertIngestionResultSchema = z.object({
-  signal: SignalSchema,
+  signal: MonitoringAlertSignalSchema,
   triageCase: TriageCaseSchema,
   deduplicated: z.boolean(),
 });
@@ -112,6 +154,218 @@ export const MonitoringAlertIngestionResultSchema = z.object({
 export type MonitoringAlertIngestionResult = z.infer<
   typeof MonitoringAlertIngestionResultSchema
 >;
+
+export const DeploymentEventIngestionResultSchema = z.object({
+  signal: DeploymentEventSignalSchema,
+  triageCase: TriageCaseSchema,
+  deduplicated: z.boolean(),
+});
+
+export type DeploymentEventIngestionResult = z.infer<
+  typeof DeploymentEventIngestionResultSchema
+>;
+
+const probability = z.number().min(0).max(1);
+
+function choiceJudgmentSchema<
+  const TValues extends readonly [string, ...string[]],
+>(values: TValues) {
+  const outcome = z.enum(values);
+  return z.object({
+    choice: outcome,
+    probabilities: z.array(z.object({ outcome, probability })),
+  });
+}
+
+export const OperationalJudgmentsSchema = z.object({
+  priorityAssessment: choiceJudgmentSchema(['P0', 'P1', 'P2', 'P3']),
+  customerReach: choiceJudgmentSchema([
+    'single',
+    'subset',
+    'widespread',
+    'unknown',
+  ]),
+  regionalReach: choiceJudgmentSchema([
+    'single_region',
+    'multi_region',
+    'global',
+    'not_applicable',
+    'unknown',
+  ]),
+  serviceBreadth: choiceJudgmentSchema([
+    'single_service',
+    'multi_service',
+    'platform_wide',
+    'unknown',
+  ]),
+  primaryOwningDomain: choiceJudgmentSchema([
+    'payments',
+    'authentication',
+    'fulfillment',
+    'platform',
+    'unknown',
+  ]),
+  evidenceSufficiency: z.object({ yesProbability: probability }),
+});
+
+export type OperationalJudgments = z.infer<typeof OperationalJudgmentsSchema>;
+
+export const EvaluationSchema = z.object({
+  id: z.uuid(),
+  triageCaseId: z.uuid(),
+  previousEvaluationId: z.uuid().nullable(),
+  correlationId: z.uuid(),
+  status: z.literal('succeeded'),
+  configuredModel: z.string().min(1),
+  resolvedModel: z.string().min(1),
+  normalizationVersion: z.literal(1),
+  decisionSchemaVersion: z.literal('operational-judgments.v1'),
+  questionSetVersion: z.literal('northstar-triage.v1'),
+  policyVersion: z.literal('northstar-automation.v1'),
+  attemptId: z.uuid(),
+  providerRequestId: z.string(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  latencyMs: z.number().nonnegative(),
+  retryCount: z.number().int().nonnegative(),
+  evaluatedAt: z.iso.datetime(),
+  judgments: OperationalJudgmentsSchema,
+});
+
+export type Evaluation = z.infer<typeof EvaluationSchema>;
+
+export const CorroboratingFactSchema = z.object({
+  id: z.uuid(),
+  kind: z.enum(['threshold_breach', 'recent_deployment']),
+  summary: z.string(),
+  evidenceSignalIds: z.array(z.uuid()).min(1),
+});
+
+export type CorroboratingFact = z.infer<typeof CorroboratingFactSchema>;
+
+export const WorkflowActionTypeSchema = z.enum([
+  'create_incident',
+  'assign_owner',
+  'page_on_call',
+]);
+
+export type WorkflowActionType = z.infer<typeof WorkflowActionTypeSchema>;
+
+export const PolicyRuleResultSchema = z.object({
+  ruleId: z.string(),
+  action: WorkflowActionTypeSchema,
+  outcome: z.enum(['authorized', 'denied']),
+  explanation: z.string(),
+});
+
+export type PolicyRuleResult = z.infer<typeof PolicyRuleResultSchema>;
+
+export const PolicyDecisionSchema = z.object({
+  id: z.uuid(),
+  triageCaseId: z.uuid(),
+  evaluationId: z.uuid(),
+  supersedesPolicyDecisionId: z.uuid().nullable(),
+  correlationId: z.uuid(),
+  version: z.literal('northstar-automation.v1'),
+  thresholds: z.object({
+    priorityChoiceProbability: probability,
+    impactChoiceProbability: probability,
+    ownershipChoiceProbability: probability,
+    evidenceSufficiencyYesProbability: probability,
+  }),
+  rules: z.array(PolicyRuleResultSchema),
+  authorizedActions: z.array(WorkflowActionTypeSchema),
+  decidedAt: z.iso.datetime(),
+});
+
+export type PolicyDecision = z.infer<typeof PolicyDecisionSchema>;
+
+export const ActionAttemptSchema = z.object({
+  id: z.uuid(),
+  attemptedAt: z.iso.datetime(),
+  outcome: z.literal('succeeded'),
+  providerReference: z.string().nullable(),
+});
+
+export const WorkflowActionSchema = z.object({
+  id: z.uuid(),
+  correlationId: z.uuid(),
+  type: WorkflowActionTypeSchema,
+  status: z.literal('succeeded'),
+  idempotencyKey: z.string(),
+  providerReference: z.string().nullable(),
+  attempts: z.array(ActionAttemptSchema),
+});
+
+export type WorkflowAction = z.infer<typeof WorkflowActionSchema>;
+
+export const IncidentSchema = z.object({
+  id: z.uuid(),
+  title: z.string(),
+  status: z.literal('open'),
+  currentPriority: z.enum(['P0', 'P1', 'P2', 'P3']),
+  primaryOwningDomain: z.enum([
+    'payments',
+    'authentication',
+    'fulfillment',
+    'platform',
+  ]),
+  createdAt: z.iso.datetime(),
+  correlationId: z.uuid(),
+});
+
+export type Incident = z.infer<typeof IncidentSchema>;
+
+export const TimelineEventSchema = z.object({
+  id: z.uuid(),
+  correlationId: z.uuid(),
+  type: z.enum(['incident_created', 'owner_assigned', 'on_call_paged']),
+  occurredAt: z.iso.datetime(),
+  summary: z.string(),
+});
+
+export type TimelineEvent = z.infer<typeof TimelineEventSchema>;
+
+export const TriageCaseDetailSchema = z.object({
+  triageCase: TriageCaseSchema,
+  signal: SignalSchema,
+  evaluation: EvaluationSchema.nullable(),
+  corroboratingFacts: z.array(CorroboratingFactSchema),
+  policyDecision: PolicyDecisionSchema.nullable(),
+  workflowActions: z.array(WorkflowActionSchema),
+  timelineEvents: z.array(TimelineEventSchema),
+  incidentId: z.uuid().nullable(),
+});
+
+export type TriageCaseDetail = z.infer<typeof TriageCaseDetailSchema>;
+
+export const IncidentDetailSchema = z.object({
+  incident: IncidentSchema,
+  signal: SignalSchema,
+  evaluation: EvaluationSchema,
+  corroboratingFacts: z.array(CorroboratingFactSchema),
+  policyDecision: PolicyDecisionSchema,
+  workflowActions: z.array(WorkflowActionSchema),
+  timelineEvents: z.array(TimelineEventSchema),
+});
+
+export type IncidentDetail = z.infer<typeof IncidentDetailSchema>;
+
+export const PageRequestSchema = z.object({
+  incidentId: z.uuid(),
+  correlationId: z.uuid(),
+  priority: z.enum(['P0', 'P1']),
+  owningDomain: z.enum([
+    'payments',
+    'authentication',
+    'fulfillment',
+    'platform',
+  ]),
+  summary: z.string(),
+  idempotencyKey: z.string(),
+});
+
+export type PageRequest = z.infer<typeof PageRequestSchema>;
 
 export const TriageQueueSchema = z.object({
   items: z.array(TriageCaseSchema),

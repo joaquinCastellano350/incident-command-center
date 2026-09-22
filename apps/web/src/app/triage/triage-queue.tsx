@@ -2,6 +2,7 @@
 
 import { Alert, AlertDescription, AlertTitle } from '#components/ui/alert';
 import { Badge } from '#components/ui/badge';
+import { Button } from '#components/ui/button';
 import {
   Card,
   CardContent,
@@ -24,6 +25,7 @@ import {
   type TriageQueue,
 } from '@incident-command-center/contracts';
 import { useEffect, useState } from 'react';
+import Link from 'next/link';
 
 import {
   subscribeToTriageQueue,
@@ -44,7 +46,9 @@ function formatReceiptTime(receivedAt: string): string {
 }
 
 function statusLabel(status: TriageCase['status']): string {
-  return status === 'queued' ? 'Queued' : 'Ready for evaluation';
+  if (status === 'queued') return 'Queued';
+  if (status === 'incident_created') return 'Incident created';
+  return 'Ready for evaluation';
 }
 
 export function TriageQueueView({
@@ -149,8 +153,17 @@ export function TriageQueueView({
                           {statusLabel(triageCase.status)}
                         </Badge>
                       </TableCell>
-                      <TableCell className="font-mono text-xs">
-                        {triageCase.sourceReference}
+                      <TableCell>
+                        <Button
+                          asChild
+                          variant="link"
+                          size="sm"
+                          className="h-auto px-0 font-mono text-xs"
+                        >
+                          <Link href={`/triage/${triageCase.id}`}>
+                            {triageCase.sourceReference}
+                          </Link>
+                        </Button>
                       </TableCell>
                       <TableCell className="font-medium">
                         {triageCase.service}
