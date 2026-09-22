@@ -17,6 +17,37 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const describeWithPostgres = databaseUrl ? describe : describe.skip;
 
+function createQueueEventReader(body: ReadableStream<Uint8Array>) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  return {
+    async next() {
+      while (true) {
+        const boundary = buffer.indexOf('\n\n');
+        if (boundary >= 0) {
+          const event = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const dataLine = event
+            .split('\n')
+            .find((line) => line.startsWith('data: '));
+          if (dataLine) {
+            return TriageQueueSchema.parse(
+              JSON.parse(dataLine.slice('data: '.length)),
+            );
+          }
+        }
+
+        const chunk = await reader.read();
+        if (chunk.done) throw new Error('Triage Queue event stream closed');
+        buffer += decoder.decode(chunk.value, { stream: true });
+      }
+    },
+    cancel: () => reader.cancel(),
+  };
+}
+
 describeWithPostgres('Monitoring Alert ingestion', () => {
   const receiptClock = new ManualClock('2026-09-21T12:04:00.000Z');
   const queueName = `${TRIAGE_QUEUE}-${randomUUID()}`;
@@ -24,6 +55,7 @@ describeWithPostgres('Monitoring Alert ingestion', () => {
   let healthSystem: ReturnType<typeof createPostgresHealthSystem>;
   let triageSystem: ReturnType<typeof createPostgresTriageSystem>;
   let api: Awaited<ReturnType<typeof buildApi>>;
+  let apiBaseUrl: string;
 
   beforeAll(async () => {
     healthSystem = createPostgresHealthSystem({
@@ -46,6 +78,7 @@ describeWithPostgres('Monitoring Alert ingestion', () => {
       allowedOrigin: 'http://localhost:3000',
       logger: false,
     });
+    apiBaseUrl = await api.listen({ host: '127.0.0.1', port: 0 });
   });
 
   afterAll(async () => {
@@ -128,6 +161,7 @@ describeWithPostgres('Monitoring Alert ingestion', () => {
         service: 'checkout-api',
         environment: null,
         region: 'us-east',
+        title: null,
         content: null,
         rawFixtureReference: null,
         normalizationVersion: 1,
@@ -336,45 +370,46 @@ describeWithPostgres('Monitoring Alert ingestion', () => {
       connectionString: databaseUrl!,
       queueName,
     });
+    const abort = new AbortController();
+    const eventResponse = await fetch(
+      `${apiBaseUrl}/api/v1/triage-cases/events`,
+      { signal: abort.signal },
+    );
+    const events = createQueueEventReader(eventResponse.body!);
+
+    expect(eventResponse.headers.get('content-type')).toContain(
+      'text/event-stream',
+    );
+    expect((await events.next()).items).toContainEqual(accepted.triageCase);
 
     await worker.start();
     try {
-      await expect
-        .poll(
-          async () => {
-            const queueResponse = await api.inject({
-              method: 'GET',
-              url: '/api/v1/triage-cases',
-            });
-            return TriageQueueSchema.parse(queueResponse.json()).items.find(
+      const updatedQueue = await Promise.race([
+        (async () => {
+          while (true) {
+            const queue = await events.next();
+            const updated = queue.items.find(
               (triageCase) => triageCase.id === accepted.triageCase.id,
-            )?.status;
-          },
-          { timeout: 15_000, interval: 100 },
-        )
-        .toBe('ready_for_evaluation');
+            );
+            if (updated?.status === 'ready_for_evaluation') return queue;
+          }
+        })(),
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(
+            () => reject(new Error('Timed out waiting for SSE update')),
+            15_000,
+          ),
+        ),
+      ]);
+
+      expect(updatedQueue.items).toContainEqual({
+        ...accepted.triageCase,
+        status: 'ready_for_evaluation',
+      });
     } finally {
+      abort.abort();
+      await events.cancel().catch(() => undefined);
       await worker.stop();
     }
-
-    const eventResponse = await api.inject({
-      method: 'GET',
-      url: '/api/v1/triage-cases/events?once=true',
-    });
-    const dataLine = eventResponse.body
-      .split('\n')
-      .find((line) => line.startsWith('data: '));
-    const queue = TriageQueueSchema.parse(
-      JSON.parse(dataLine?.slice('data: '.length) ?? 'null'),
-    );
-
-    expect(eventResponse.statusCode).toBe(200);
-    expect(eventResponse.headers['content-type']).toContain(
-      'text/event-stream',
-    );
-    expect(queue.items).toContainEqual({
-      ...accepted.triageCase,
-      status: 'ready_for_evaluation',
-    });
   });
 });

@@ -20,18 +20,20 @@ import {
 } from '#components/ui/table';
 import { Activity, CircleAlert, Inbox, Radio, RefreshCw } from 'lucide-react';
 import {
-  TriageQueueSchema,
   type TriageCase,
   type TriageQueue,
 } from '@incident-command-center/contracts';
 import { useEffect, useState } from 'react';
 
+import {
+  subscribeToTriageQueue,
+  type TriageQueueConnectionMode,
+} from './triage-queue-client';
+
 interface TriageQueueViewProperties {
   apiBaseUrl: string;
   initialQueue: TriageQueue;
 }
-
-type ConnectionMode = 'connecting' | 'live' | 'polling';
 
 function formatReceiptTime(receivedAt: string): string {
   return new Intl.DateTimeFormat('en', {
@@ -50,58 +52,25 @@ export function TriageQueueView({
   initialQueue,
 }: TriageQueueViewProperties) {
   const [queue, setQueue] = useState(initialQueue);
-  const [mode, setMode] = useState<ConnectionMode>('connecting');
+  const [mode, setMode] = useState<TriageQueueConnectionMode>('connecting');
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let pollingTimer: ReturnType<typeof setInterval> | undefined;
-    let disposed = false;
-    const events = new EventSource(`${apiBaseUrl}/api/v1/triage-cases/events`);
-
-    const pollQueue = async (): Promise<void> => {
-      try {
-        const response = await fetch(`${apiBaseUrl}/api/v1/triage-cases`, {
-          cache: 'no-store',
-        });
-        if (!response.ok) throw new Error('Triage Queue request failed');
-        setQueue(TriageQueueSchema.parse(await response.json()));
-        setError(null);
-      } catch {
-        setError('Live updates are unavailable. Retrying the Triage Queue.');
-      }
-    };
-
-    const beginPolling = (): void => {
-      if (pollingTimer || disposed) return;
-      setMode('polling');
-      void pollQueue();
-      pollingTimer = setInterval(() => void pollQueue(), 2_000);
-    };
-
-    events.addEventListener('triage-queue', (event) => {
-      try {
-        setQueue(TriageQueueSchema.parse(JSON.parse(event.data)));
-        setMode('live');
-        setError(null);
-      } catch {
-        events.close();
-        beginPolling();
-      }
+    return subscribeToTriageQueue({
+      apiBaseUrl,
+      onQueue: setQueue,
+      onMode: setMode,
+      onError: setError,
     });
-    events.onopen = () => setMode('live');
-    events.onerror = () => {
-      events.close();
-      beginPolling();
-    };
-
-    return () => {
-      disposed = true;
-      events.close();
-      if (pollingTimer) clearInterval(pollingTimer);
-    };
   }, [apiBaseUrl]);
 
   const live = mode === 'live';
+  const connectionLabel =
+    mode === 'live'
+      ? 'Live updates'
+      : mode === 'polling'
+        ? 'Polling fallback'
+        : 'Connecting';
 
   return (
     <main className="mx-auto min-h-screen w-full max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
@@ -119,7 +88,7 @@ export function TriageQueueView({
           ) : (
             <RefreshCw aria-hidden="true" />
           )}
-          {live ? 'Live updates' : 'Polling fallback'}
+          {connectionLabel}
         </Badge>
       </header>
       <Separator className="my-6" />

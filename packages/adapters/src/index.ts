@@ -52,7 +52,7 @@ interface SignalRow {
   service: string;
   environment: string | null;
   region: string | null;
-  title: string;
+  title: string | null;
   content: string | null;
   facts: unknown;
   normalization_version: 1;
@@ -97,7 +97,7 @@ const schemaSql = `
     service text NOT NULL,
     environment text,
     region text,
-    title text NOT NULL,
+    title text,
     content text,
     facts jsonb NOT NULL,
     normalization_version integer NOT NULL,
@@ -116,6 +116,8 @@ const schemaSql = `
     received_at timestamptz NOT NULL,
     correlation_id uuid NOT NULL
   );
+
+  ALTER TABLE signals ALTER COLUMN title DROP NOT NULL;
 `;
 
 export async function ensureApplicationSchema(pool: Pool): Promise<void> {
@@ -130,12 +132,17 @@ function clientDatabase(client: PoolClient): TransactionalDatabase {
   };
 }
 
-class PgBossHealthJobQueue implements HealthJobQueue {
+interface MessageSchema<TMessage> {
+  parse(input: unknown): TMessage;
+}
+
+class PgBossJobQueue<TMessage extends object> {
   readonly #boss: PgBoss;
 
   constructor(
     connectionString: string,
     readonly name: string,
+    private readonly messageSchema: MessageSchema<TMessage>,
   ) {
     this.#boss = new PgBoss({ connectionString });
   }
@@ -153,26 +160,22 @@ class PgBossHealthJobQueue implements HealthJobQueue {
   }
 
   async enqueue(
-    message: HealthCheckMessageV1,
+    message: TMessage,
     options: { id: string; transaction: TransactionalDatabase },
   ): Promise<void> {
-    await this.#boss.send(
-      this.name,
-      HealthCheckMessageV1Schema.parse(message),
-      {
-        id: options.id,
-        db: options.transaction as Db,
-        retryLimit: 3,
-        retryDelay: 1,
-        retryBackoff: true,
-        deleteAfterSeconds: 0,
-      },
-    );
+    await this.#boss.send(this.name, this.messageSchema.parse(message), {
+      id: options.id,
+      db: options.transaction as Db,
+      retryLimit: 3,
+      retryDelay: 1,
+      retryBackoff: true,
+      deleteAfterSeconds: 0,
+    });
   }
 
   async process(
     handler: (
-      message: HealthCheckMessageV1,
+      message: TMessage,
       transaction: TransactionalDatabase,
     ) => Promise<void>,
   ): Promise<void> {
@@ -185,10 +188,7 @@ class PgBossHealthJobQueue implements HealthJobQueue {
       async (jobs, transaction) => {
         const job = jobs[0];
         if (job) {
-          await handler(
-            HealthCheckMessageV1Schema.parse(job.data),
-            transaction,
-          );
+          await handler(this.messageSchema.parse(job.data), transaction);
         }
       },
     );
@@ -405,61 +405,6 @@ export class PgBossHealthJobWorker {
   }
 }
 
-class PgBossTriageJobQueue implements TriageJobQueue {
-  readonly #boss: PgBoss;
-
-  constructor(
-    connectionString: string,
-    readonly name: string,
-  ) {
-    this.#boss = new PgBoss({ connectionString });
-  }
-
-  async start(): Promise<void> {
-    this.#boss.on('error', (error) => {
-      console.error('pg-boss error', error);
-    });
-    await this.#boss.start();
-    await this.#boss.createQueue(this.name, { notify: true });
-  }
-
-  async stop(): Promise<void> {
-    await this.#boss.stop({ graceful: true, timeout: 10_000 });
-  }
-
-  async enqueue(
-    message: TriageJobMessageV1,
-    options: { id: string; transaction: TransactionalDatabase },
-  ): Promise<void> {
-    await this.#boss.send(this.name, TriageJobMessageV1Schema.parse(message), {
-      id: options.id,
-      db: options.transaction as Db,
-      retryLimit: 3,
-      retryDelay: 1,
-      retryBackoff: true,
-      deleteAfterSeconds: 0,
-    });
-  }
-
-  async process(
-    handler: (
-      message: TriageJobMessageV1,
-      transaction: TransactionalDatabase,
-    ) => Promise<void>,
-  ): Promise<void> {
-    await this.#boss.work(
-      this.name,
-      { transactional: true, pollingIntervalSeconds: 0.5 },
-      async (jobs, transaction) => {
-        const job = jobs[0];
-        if (job) {
-          await handler(TriageJobMessageV1Schema.parse(job.data), transaction);
-        }
-      },
-    );
-  }
-}
-
 export class PostgresTriageSystem implements TriageSystem {
   constructor(
     private readonly pool: Pool,
@@ -510,7 +455,7 @@ export class PostgresTriageSystem implements TriageSystem {
           input.service,
           input.environment ?? null,
           input.region,
-          input.title ?? `${input.metric} crossed its threshold`,
+          input.title ?? null,
           input.content ?? null,
           JSON.stringify({
             metric: input.metric,
@@ -644,7 +589,11 @@ export function createPostgresHealthSystem({
   queueName = HEALTH_CHECK_QUEUE,
 }: HealthRuntimeOptions): PostgresHealthSystem {
   const pool = new PostgresPool({ connectionString });
-  const queue = new PgBossHealthJobQueue(connectionString, queueName);
+  const queue = new PgBossJobQueue(
+    connectionString,
+    queueName,
+    HealthCheckMessageV1Schema,
+  );
   return new PostgresHealthSystem(pool, queue, clock);
 }
 
@@ -654,7 +603,11 @@ export function createPostgresHealthJobWorker({
   queueName = HEALTH_CHECK_QUEUE,
 }: HealthRuntimeOptions): PgBossHealthJobWorker {
   const pool = new PostgresPool({ connectionString });
-  const queue = new PgBossHealthJobQueue(connectionString, queueName);
+  const queue = new PgBossJobQueue(
+    connectionString,
+    queueName,
+    HealthCheckMessageV1Schema,
+  );
   return new PgBossHealthJobWorker(pool, queue, clock);
 }
 
@@ -666,7 +619,8 @@ export function createPostgresTriageSystem({
 }: TriageRuntimeOptions): PostgresTriageSystem {
   const pool = new PostgresPool({ connectionString });
   const queue =
-    providedQueue ?? new PgBossTriageJobQueue(connectionString, queueName);
+    providedQueue ??
+    new PgBossJobQueue(connectionString, queueName, TriageJobMessageV1Schema);
   return new PostgresTriageSystem(pool, queue, clock);
 }
 
@@ -675,6 +629,10 @@ export function createPostgresTriageWorker({
   queueName = TRIAGE_QUEUE,
 }: Omit<TriageRuntimeOptions, 'clock'>): PgBossTriageWorker {
   const pool = new PostgresPool({ connectionString });
-  const queue = new PgBossTriageJobQueue(connectionString, queueName);
+  const queue = new PgBossJobQueue(
+    connectionString,
+    queueName,
+    TriageJobMessageV1Schema,
+  );
   return new PgBossTriageWorker(pool, queue);
 }

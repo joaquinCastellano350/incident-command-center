@@ -23,9 +23,11 @@ interface BuildApiDependencies {
 }
 
 const JobParametersSchema = z.object({ id: z.uuid() });
-const TriageEventsQuerySchema = z.object({
-  once: z.literal('true').optional(),
-});
+function requestCorrelationId(header: string | string[] | undefined): string {
+  const candidate = Array.isArray(header) ? header[0] : header;
+  const parsed = z.uuid().safeParse(candidate);
+  return parsed.success ? parsed.data : randomUUID();
+}
 
 function triageQueueEvent(
   items: Awaited<ReturnType<TriageSystem['listTriageCases']>>,
@@ -42,7 +44,8 @@ export async function buildApi({
 }: BuildApiDependencies): Promise<FastifyInstance> {
   const app = Fastify({
     logger,
-    requestIdHeader: 'x-correlation-id',
+    genReqId: (request) =>
+      requestCorrelationId(request.headers['x-correlation-id']),
   });
 
   await app.register(cors, {
@@ -56,17 +59,7 @@ export async function buildApi({
   });
 
   app.post('/api/v1/health-jobs', async (request, reply) => {
-    const correlationHeader = request.headers['x-correlation-id'];
-    const parsedCorrelationId = z
-      .uuid()
-      .safeParse(
-        Array.isArray(correlationHeader)
-          ? correlationHeader[0]
-          : correlationHeader,
-      );
-    const correlationId = parsedCorrelationId.success
-      ? parsedCorrelationId.data
-      : randomUUID();
+    const correlationId = z.uuid().parse(request.id);
     const job = HealthCheckJobSchema.parse(
       await healthSystem.submitHealthCheck(correlationId),
     );
@@ -104,17 +97,7 @@ export async function buildApi({
         });
       }
 
-      const correlationHeader = request.headers['x-correlation-id'];
-      const parsedCorrelationId = z
-        .uuid()
-        .safeParse(
-          Array.isArray(correlationHeader)
-            ? correlationHeader[0]
-            : correlationHeader,
-        );
-      const correlationId = parsedCorrelationId.success
-        ? parsedCorrelationId.data
-        : randomUUID();
+      const correlationId = z.uuid().parse(request.id);
       const result = MonitoringAlertIngestionResultSchema.parse(
         await triageSystem.ingestMonitoringAlert(input.data, correlationId),
       );
@@ -134,19 +117,6 @@ export async function buildApi({
     });
 
     app.get('/api/v1/triage-cases/events', async (request, reply) => {
-      const query = TriageEventsQuerySchema.safeParse(request.query);
-      if (!query.success) {
-        return reply.code(400).send({ error: 'Invalid event stream query' });
-      }
-
-      if (query.data.once === 'true') {
-        return reply
-          .header('cache-control', 'no-cache, no-transform')
-          .header('connection', 'keep-alive')
-          .type('text/event-stream')
-          .send(triageQueueEvent(await triageSystem.listTriageCases()));
-      }
-
       reply.hijack();
       reply.raw.writeHead(200, {
         'access-control-allow-origin': allowedOrigin,

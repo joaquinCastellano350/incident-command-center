@@ -75,7 +75,7 @@ export const SignalSchema = z.object({
   service: z.string(),
   environment: z.string().nullable(),
   region: z.string().nullable(),
-  title: z.string(),
+  title: z.string().nullable(),
   content: z.string().nullable(),
   facts: MonitoringAlertFactsSchema,
   normalizationVersion: z.literal(1),
