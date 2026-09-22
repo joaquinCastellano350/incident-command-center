@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "imports": {
+    "#components/*": "./src/components/*.tsx",
+    "#hooks/*": "./src/hooks/*.ts",
+    "#lib/*": "./src/lib/*.ts"
+  },
   "scripts": {
     "dev": "next dev --hostname 0.0.0.0",
     "build": "next build",
@@ -11,9 +16,18 @@
   },
   "dependencies": {
     "@incident-command-center/contracts": "*",
+    "@tailwindcss/postcss": "^4.3.3",
+    "class-variance-authority": "^0.7.1",
+    "cn": "^0.3.2",
+    "lucide-react": "^1.47.0",
     "next": "16.3.5",
+    "postcss": "^8.5.28",
+    "radix-ui": "^1.6.7",
     "react": "19.3.0",
     "react-dom": "19.3.0",
+    "shadcn": "^4.21.0",
+    "tailwindcss": "^4.3.3",
+    "tw-animate-css": "^1.4.0",
     "zod": "4.6.5"
   }
 }

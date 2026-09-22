@@ -1,7 +1,12 @@
 import type { Metadata } from 'next';
+import { Geist } from 'next/font/google';
 import type { ReactNode } from 'react';
 
+import { cn } from '#lib/utils';
+
 import './styles.css';
+
+const geist = Geist({ subsets: ['latin'], variable: '--font-geist-sans' });
 
 export const metadata: Metadata = {
   title: 'Incident Command Center',
@@ -10,7 +15,7 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" className={cn('dark font-sans', geist.variable)}>
       <body>{children}</body>
     </html>
   );

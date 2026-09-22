@@ -2,6 +2,10 @@ import type {
   HealthCheckJob,
   HealthCheckMessageV1,
   HealthStatus,
+  MonitoringAlertIngestionResult,
+  MonitoringAlertInput,
+  TriageCase,
+  TriageJobMessageV1,
 } from '@incident-command-center/contracts';
 
 export interface HealthSystem {
@@ -25,6 +29,30 @@ export interface HealthJobQueue {
   process(
     handler: (
       message: HealthCheckMessageV1,
+      transaction: TransactionalDatabase,
+    ) => Promise<void>,
+  ): Promise<void>;
+}
+
+export interface TriageSystem {
+  ingestMonitoringAlert(
+    input: MonitoringAlertInput,
+    correlationId: string,
+  ): Promise<MonitoringAlertIngestionResult>;
+  listTriageCases(): Promise<TriageCase[]>;
+}
+
+export interface TriageJobQueue {
+  readonly name: string;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  enqueue(
+    message: TriageJobMessageV1,
+    options: { id: string; transaction: TransactionalDatabase },
+  ): Promise<void>;
+  process(
+    handler: (
+      message: TriageJobMessageV1,
       transaction: TransactionalDatabase,
     ) => Promise<void>,
   ): Promise<void>;

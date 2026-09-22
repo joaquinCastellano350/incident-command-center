@@ -4,6 +4,7 @@
     "jsx": "preserve",
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "resolvePackageJsonImports": true,
     "plugins": [{ "name": "next" }],
     "incremental": true
   },

@@ -1,4 +1,7 @@
-import { createPostgresHealthSystem } from '@incident-command-center/adapters';
+import {
+  createPostgresHealthSystem,
+  createPostgresTriageSystem,
+} from '@incident-command-center/adapters';
 import { SystemClock } from '@incident-command-center/domain';
 
 import { buildApi } from './app.js';
@@ -10,15 +13,22 @@ const healthSystem = createPostgresHealthSystem({
   connectionString: config.DATABASE_URL,
   clock,
 });
+const triageSystem = createPostgresTriageSystem({
+  connectionString: config.DATABASE_URL,
+  clock,
+});
 
 await healthSystem.start();
+await triageSystem.start();
 const app = await buildApi({
   healthSystem,
+  triageSystem,
   allowedOrigin: config.WEB_ORIGIN,
 });
 
 const shutdown = async (): Promise<void> => {
   await app.close();
+  await triageSystem.stop();
   await healthSystem.stop();
 };
 
