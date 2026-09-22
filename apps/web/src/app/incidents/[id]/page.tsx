@@ -48,6 +48,7 @@ export default async function IncidentPage({
       <DecisionTrace
         signal={detail.signal}
         evaluation={detail.evaluation}
+        reviewTask={detail.reviewTask}
         corroboratingFacts={detail.corroboratingFacts}
         policyDecision={detail.policyDecision}
         workflowActions={detail.workflowActions}
