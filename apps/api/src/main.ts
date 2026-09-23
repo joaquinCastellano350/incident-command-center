@@ -24,6 +24,8 @@ const app = await buildApi({
   healthSystem,
   triageSystem,
   allowedOrigin: config.WEB_ORIGIN,
+  operatorKey: config.OPERATOR_KEY,
+  publicReadOnly: config.PUBLIC_DEMO_READ_ONLY === 'true',
 });
 
 const shutdown = async (): Promise<void> => {

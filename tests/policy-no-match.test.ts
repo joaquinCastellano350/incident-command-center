@@ -37,4 +37,23 @@ describe('candidate Incident decision gate', () => {
       decision.rules.find((rule) => rule.action === 'create_incident'),
     ).toMatchObject({ outcome: 'denied' });
   });
+
+  it('denies every automated action when Evidence Sufficiency is low despite strong Choices', () => {
+    const lowEvidence = {
+      ...judgments,
+      evidenceSufficiency: { yesProbability: 0.94 },
+    };
+    expect(
+      decideAutomation(lowEvidence, true, {
+        outcome: 'no_match',
+        incidentId: null,
+      }).authorizedActions,
+    ).toEqual([]);
+    expect(
+      decideAutomation(lowEvidence, true, {
+        outcome: 'same_incident',
+        incidentId: 'candidate',
+      }).authorizedActions,
+    ).toEqual([]);
+  });
 });

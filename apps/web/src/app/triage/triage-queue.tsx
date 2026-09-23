@@ -50,6 +50,7 @@ function statusLabel(status: TriageCase['status']): string {
   if (status === 'incident_created') return 'Incident created';
   if (status === 'needs_review') return 'Needs review';
   if (status === 'evidence_linked') return 'Evidence linked';
+  if (status === 'dismissed') return 'Dismissed';
   return 'Ready for evaluation';
 }
 
@@ -104,6 +105,9 @@ export function TriageQueueView({
           Incoming Signals and their durable processing state. A Triage Case
           remains distinct from an Incident until a later decision.
         </p>
+        <Button asChild variant="outline" size="sm">
+          <Link href="/reviews">Open Review Tasks</Link>
+        </Button>
       </section>
 
       {error && (

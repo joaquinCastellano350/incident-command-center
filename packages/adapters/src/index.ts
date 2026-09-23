@@ -16,6 +16,7 @@ import {
   CorroboratingFactSchema,
   EvaluationSchema,
   ReviewTaskSchema,
+  HumanOverrideSchema,
   HealthCheckJobSchema,
   HealthCheckMessageV1Schema,
   IncidentDetailSchema,
@@ -54,6 +55,9 @@ import {
   type TriageCase,
   type TriageCaseDetail,
   type TriageJobMessageV1,
+  type ReviewQueue,
+  type ReviewCommand,
+  type PriorityOverrideCommand,
   type TimelineEvent,
   type WorkflowAction,
   type WorkflowActionDefinition,
@@ -66,6 +70,7 @@ import {
   evaluateCustomerReportDeterministically,
   evaluateMonitoringAlertDeterministically,
   NORTHSTAR_SERVICE_DOMAINS,
+  reviewUrgency,
   WorkflowProviderError,
   type AssignmentProviderPort,
   type Clock,
@@ -89,6 +94,8 @@ export {
 
 export const HEALTH_CHECK_QUEUE = 'system-health-check';
 export const TRIAGE_QUEUE = 'triage-case-processing';
+export class ReviewConflictError extends Error {}
+export class ReviewTargetNotFoundError extends Error {}
 const WORKER_READY_WINDOW_MS = 15_000;
 const APPLICATION_SCHEMA_LOCK = 740_219_350;
 const TRIAGE_MATCH_LOCK = 740_219_351;
@@ -137,7 +144,8 @@ interface TriageCaseRow {
     | 'ready_for_evaluation'
     | 'incident_created'
     | 'needs_review'
-    | 'evidence_linked';
+    | 'evidence_linked'
+    | 'dismissed';
   source_reference: string;
   service: string;
   region: string | null;
@@ -213,7 +221,7 @@ const schemaSql = `
     CHECK (source_type IN ('monitoring_alert', 'deployment_event', 'customer_report'));
   ALTER TABLE triage_cases DROP CONSTRAINT IF EXISTS triage_cases_status_check;
   ALTER TABLE triage_cases ADD CONSTRAINT triage_cases_status_check
-    CHECK (status IN ('queued', 'ready_for_evaluation', 'incident_created', 'needs_review', 'evidence_linked'));
+    CHECK (status IN ('queued', 'ready_for_evaluation', 'incident_created', 'needs_review', 'evidence_linked', 'dismissed'));
 
   CREATE INDEX IF NOT EXISTS signals_service_region_occurred
     ON signals (service, region, occurred_at DESC);
@@ -248,6 +256,13 @@ const schemaSql = `
     record jsonb NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS human_overrides (
+    id uuid PRIMARY KEY,
+    triage_case_id uuid NOT NULL REFERENCES triage_cases(id),
+    incident_id uuid REFERENCES incidents(id),
+    record jsonb NOT NULL
+  );
+
   CREATE INDEX IF NOT EXISTS incidents_title_search
     ON incidents USING gin (to_tsvector('english', coalesce(record->>'title', '')));
   CREATE INDEX IF NOT EXISTS incidents_title_trigram
@@ -259,9 +274,10 @@ const schemaSql = `
     signal_id uuid NOT NULL UNIQUE REFERENCES signals(id),
     triage_case_id uuid NOT NULL UNIQUE REFERENCES triage_cases(id),
     evaluation_id uuid NOT NULL REFERENCES evaluations(id),
-    policy_decision_id uuid NOT NULL REFERENCES policy_decisions(id),
+    policy_decision_id uuid REFERENCES policy_decisions(id),
     record jsonb NOT NULL
   );
+  ALTER TABLE evidence_links ALTER COLUMN policy_decision_id DROP NOT NULL;
   CREATE INDEX IF NOT EXISTS evidence_links_incident_id ON evidence_links (incident_id);
 
   CREATE TABLE IF NOT EXISTS workflow_actions (
@@ -958,6 +974,280 @@ export class PostgresTriageSystem implements TriageSystem {
     return result.rows.map(mapTriageCase);
   }
 
+  async listReviewTasks(): Promise<ReviewQueue> {
+    const result = await this.pool.query<
+      TriageCaseRow & { review_record: unknown }
+    >(
+      `SELECT tc.*, rt.record AS review_record
+       FROM review_tasks rt JOIN triage_cases tc ON tc.id = rt.triage_case_id
+       WHERE rt.record->>'resolvedAt' IS NULL
+       ORDER BY CASE rt.record->>'urgency' WHEN 'urgent' THEN 0 ELSE 1 END,
+         tc.received_at, tc.id`,
+    );
+    return {
+      items: result.rows.map((row) => ({
+        reviewTask: ReviewTaskSchema.parse(row.review_record),
+        triageCase: mapTriageCase(row),
+      })),
+    };
+  }
+
+  async resolveReview(
+    id: string,
+    command: ReviewCommand,
+  ): Promise<TriageCaseDetail | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const caseResult = await client.query<TriageCaseRow>(
+        'SELECT * FROM triage_cases WHERE id = $1 FOR UPDATE',
+        [id],
+      );
+      const triageCase = caseResult.rows[0];
+      if (!triageCase) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const taskResult = await client.query<{ record: unknown }>(
+        'SELECT record FROM review_tasks WHERE triage_case_id = $1 FOR UPDATE',
+        [id],
+      );
+      const task = taskResult.rows[0]
+        ? ReviewTaskSchema.parse(taskResult.rows[0].record)
+        : null;
+      if (!task || task.resolvedAt) {
+        throw new ReviewConflictError('Review Task is not open');
+      }
+      const allowed =
+        triageCase.status === 'needs_review'
+          ? ['create_incident', 'link_incident', 'dismiss']
+          : triageCase.status === 'incident_created'
+            ? ['assign_owner']
+            : triageCase.status === 'evidence_linked'
+              ? ['accept_link']
+              : [];
+      if (!allowed.includes(command.resolution.type)) {
+        throw new ReviewConflictError(
+          'Resolution is not available for this Triage Case',
+        );
+      }
+      const signalResult = await client.query<SignalRow>(
+        'SELECT * FROM signals WHERE id = $1',
+        [triageCase.signal_id],
+      );
+      const signal = mapSignal(signalResult.rows[0]!);
+      const timestamp = this.clock.now().toISOString();
+      let incidentId: string | null = null;
+      if (command.resolution.type === 'create_incident') {
+        const incident = IncidentSchema.parse({
+          id: randomUUID(),
+          title: signal.title ?? signal.sourceReference,
+          status: 'open',
+          resolvedAt: null,
+          currentPriority: command.resolution.priority,
+          primaryOwningDomain: command.resolution.owningDomain,
+          createdAt: timestamp,
+          correlationId: triageCase.correlation_id,
+        });
+        incidentId = incident.id;
+        await client.query(
+          'INSERT INTO incidents (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)',
+          [incident.id, id, JSON.stringify(incident)],
+        );
+        const event = TimelineEventSchema.parse({
+          id: randomUUID(),
+          correlationId: triageCase.correlation_id,
+          type: 'incident_created',
+          occurredAt: timestamp,
+          summary: `Operator ${command.actor} created this Incident after review.`,
+        });
+        await client.query(
+          'INSERT INTO timeline_events (id, incident_id, record) VALUES ($1, $2, $3::jsonb)',
+          [event.id, incident.id, JSON.stringify(event)],
+        );
+        await client.query(
+          "UPDATE triage_cases SET status = 'incident_created' WHERE id = $1",
+          [id],
+        );
+      } else if (command.resolution.type === 'link_incident') {
+        const target = await client.query(
+          'SELECT id FROM incidents WHERE id = $1 FOR UPDATE',
+          [command.resolution.incidentId],
+        );
+        if (!target.rows[0]) {
+          throw new ReviewTargetNotFoundError('Incident not found');
+        }
+        const evaluationResult = await client.query<{ id: string }>(
+          `SELECT id FROM evaluations WHERE triage_case_id = $1
+           ORDER BY record->>'evaluatedAt' DESC LIMIT 1`,
+          [id],
+        );
+        if (!evaluationResult.rows[0]) {
+          throw new ReviewConflictError('Review requires an Evaluation');
+        }
+        const policyResult = await client.query<{ id: string }>(
+          `SELECT id FROM policy_decisions WHERE triage_case_id = $1
+           ORDER BY record->>'decidedAt' DESC LIMIT 1`,
+          [id],
+        );
+        incidentId = command.resolution.incidentId;
+        const link = EvidenceLinkSchema.parse({
+          id: randomUUID(),
+          incidentId,
+          signalId: signal.id,
+          evaluationId: evaluationResult.rows[0].id,
+          policyDecisionId: policyResult.rows[0]?.id ?? null,
+          correlationId: triageCase.correlation_id,
+          relationship: 'same_incident',
+          createdAt: timestamp,
+        });
+        await client.query(
+          `INSERT INTO evidence_links
+           (id, incident_id, signal_id, triage_case_id, evaluation_id, policy_decision_id, record)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+          [
+            link.id,
+            incidentId,
+            signal.id,
+            id,
+            link.evaluationId,
+            link.policyDecisionId,
+            JSON.stringify(link),
+          ],
+        );
+        const event = TimelineEventSchema.parse({
+          id: randomUUID(),
+          correlationId: triageCase.correlation_id,
+          type: 'evidence_linked',
+          occurredAt: timestamp,
+          summary: `Operator ${command.actor} linked Signal ${signal.sourceReference} after review.`,
+        });
+        await client.query(
+          'INSERT INTO timeline_events (id, incident_id, record) VALUES ($1, $2, $3::jsonb)',
+          [event.id, incidentId, JSON.stringify(event)],
+        );
+        await client.query(
+          "UPDATE triage_cases SET status = 'evidence_linked' WHERE id = $1",
+          [id],
+        );
+      } else if (command.resolution.type === 'assign_owner') {
+        const result = await client.query<{ id: string; record: unknown }>(
+          'SELECT id, record FROM incidents WHERE triage_case_id = $1 FOR UPDATE',
+          [id],
+        );
+        const incidentRow = result.rows[0];
+        if (!incidentRow) throw new ReviewConflictError('Incident is missing');
+        const incident = IncidentSchema.parse(incidentRow.record);
+        if (incident.primaryOwningDomain !== 'unknown') {
+          throw new ReviewConflictError('Incident already has an owner');
+        }
+        incidentId = incident.id;
+        await client.query(
+          "UPDATE incidents SET record = jsonb_set(record, '{primaryOwningDomain}', to_jsonb($2::text)) WHERE id = $1",
+          [incidentId, command.resolution.owningDomain],
+        );
+        const event = TimelineEventSchema.parse({
+          id: randomUUID(),
+          correlationId: triageCase.correlation_id,
+          type: 'owner_assigned',
+          occurredAt: timestamp,
+          summary: `Operator ${command.actor} assigned ${command.resolution.owningDomain} after review.`,
+        });
+        await client.query(
+          'INSERT INTO timeline_events (id, incident_id, record) VALUES ($1, $2, $3::jsonb)',
+          [event.id, incidentId, JSON.stringify(event)],
+        );
+      } else if (command.resolution.type === 'accept_link') {
+        const result = await client.query<{ incident_id: string }>(
+          'SELECT incident_id FROM evidence_links WHERE triage_case_id = $1',
+          [id],
+        );
+        if (!result.rows[0])
+          throw new ReviewConflictError('Evidence Link is missing');
+        incidentId = result.rows[0].incident_id;
+      } else {
+        await client.query(
+          "UPDATE triage_cases SET status = 'dismissed' WHERE id = $1",
+          [id],
+        );
+      }
+      const override = HumanOverrideSchema.parse({
+        id: randomUUID(),
+        triageCaseId: id,
+        correlationId: triageCase.correlation_id,
+        actor: command.actor,
+        reason: command.reason,
+        recordedAt: timestamp,
+        replacementOutcome: command.resolution,
+      });
+      await client.query(
+        'INSERT INTO human_overrides (id, triage_case_id, incident_id, record) VALUES ($1, $2, $3, $4::jsonb)',
+        [override.id, id, incidentId, JSON.stringify(override)],
+      );
+      await client.query(
+        "UPDATE review_tasks SET record = jsonb_set(record, '{resolvedAt}', to_jsonb($2::text)) WHERE triage_case_id = $1",
+        [id, timestamp],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.findTriageCase(id);
+  }
+
+  async overridePriority(
+    id: string,
+    command: PriorityOverrideCommand,
+  ): Promise<IncidentDetail | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<{
+        triage_case_id: string;
+        record: unknown;
+      }>(
+        'SELECT triage_case_id, record FROM incidents WHERE id = $1 FOR UPDATE',
+        [id],
+      );
+      if (!result.rows[0]) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const incident = IncidentSchema.parse(result.rows[0].record);
+      const override = HumanOverrideSchema.parse({
+        id: randomUUID(),
+        triageCaseId: result.rows[0].triage_case_id,
+        correlationId: incident.correlationId,
+        actor: command.actor,
+        reason: command.reason,
+        recordedAt: this.clock.now().toISOString(),
+        replacementOutcome: {
+          type: 'set_priority',
+          priority: command.priority,
+          incidentId: id,
+        },
+      });
+      await client.query(
+        "UPDATE incidents SET record = jsonb_set(record, '{currentPriority}', to_jsonb($2::text)) WHERE id = $1",
+        [id, command.priority],
+      );
+      await client.query(
+        'INSERT INTO human_overrides (id, triage_case_id, incident_id, record) VALUES ($1, $2, $3, $4::jsonb)',
+        [override.id, override.triageCaseId, id, JSON.stringify(override)],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.findIncident(id);
+  }
+
   async findTriageCase(id: string): Promise<TriageCaseDetail | null> {
     const triageResult = await this.pool.query<TriageCaseRow>(
       'SELECT * FROM triage_cases WHERE id = $1',
@@ -970,6 +1260,7 @@ export class PostgresTriageSystem implements TriageSystem {
       signalResult,
       evaluationResult,
       reviewResult,
+      overrideResult,
       factResult,
       policyResult,
       actionResult,
@@ -987,6 +1278,11 @@ export class PostgresTriageSystem implements TriageSystem {
       ),
       this.pool.query<{ record: unknown }>(
         'SELECT record FROM review_tasks WHERE triage_case_id = $1',
+        [id],
+      ),
+      this.pool.query<{ record: unknown }>(
+        `SELECT record FROM human_overrides WHERE triage_case_id = $1
+         ORDER BY record->>'recordedAt', id`,
         [id],
       ),
       this.pool.query<{ record: unknown }>(
@@ -1023,6 +1319,7 @@ export class PostgresTriageSystem implements TriageSystem {
       signal: mapSignal(signalResult.rows[0]!),
       evaluation: evaluationResult.rows[0]?.record ?? null,
       reviewTask: reviewResult.rows[0]?.record ?? null,
+      humanOverrides: overrideResult.rows.map((row) => row.record),
       corroboratingFacts: factResult.rows.map((row) => row.record),
       policyDecision: policyResult.rows[0]?.record ?? null,
       workflowActions: actionResult,
@@ -1053,6 +1350,7 @@ export class PostgresTriageSystem implements TriageSystem {
       signalResult,
       evaluationResult,
       reviewResult,
+      overrideResult,
       factResult,
       policyResult,
       actionResult,
@@ -1070,6 +1368,11 @@ export class PostgresTriageSystem implements TriageSystem {
       this.pool.query<{ record: unknown }>(
         'SELECT record FROM review_tasks WHERE triage_case_id = $1',
         [incidentRow.triage_case_id],
+      ),
+      this.pool.query<{ record: unknown }>(
+        `SELECT record FROM human_overrides WHERE incident_id = $1
+         ORDER BY record->>'recordedAt', id`,
+        [id],
       ),
       this.pool.query<{ record: unknown }>(
         "SELECT record FROM corroborating_facts WHERE triage_case_id = $1 ORDER BY record->>'kind'",
@@ -1103,8 +1406,9 @@ export class PostgresTriageSystem implements TriageSystem {
       signal: mapSignal(signalResult.rows[0]!),
       evaluation: evaluationResult.rows[0]!.record,
       reviewTask: reviewResult.rows[0]?.record ?? null,
+      humanOverrides: overrideResult.rows.map((row) => row.record),
       corroboratingFacts: factResult.rows.map((row) => row.record),
-      policyDecision: policyResult.rows[0]!.record,
+      policyDecision: policyResult.rows[0]?.record ?? null,
       workflowActions: actionResult,
       timelineEvents: timelineResult.rows.map((row) => row.record),
       evidenceLinks: evidenceResult.rows.map((row) => ({
@@ -1572,15 +1876,19 @@ export class PgBossTriageWorker {
         id: randomUUID(),
         triageCaseId: message.triageCaseId,
         correlationId: message.correlationId,
-        urgency: ['P0', 'P1'].includes(judgments.priorityAssessment.choice)
-          ? 'urgent'
-          : 'standard',
+        urgency: reviewUrgency(
+          judgments.priorityAssessment,
+          corroboratingFacts.length > 0,
+        ),
         reason:
-          relationship.outcome === 'review'
-            ? 'Candidate relationship is uncertain or related but distinct; Operator review is required.'
-            : relationship.outcome === 'same_incident'
-              ? 'Incident Match or Evidence Sufficiency did not authorize an Evidence Link.'
-              : 'Operational Judgments did not meet Incident creation policy.',
+          judgments.evidenceSufficiency.yesProbability <
+          automation.thresholds.evidenceSufficiencyYesProbability
+            ? 'Evidence Sufficiency is below the automation threshold; Operator review is required.'
+            : relationship.outcome === 'review'
+              ? 'Candidate relationship is uncertain or related but distinct; Operator review is required.'
+              : relationship.outcome === 'same_incident'
+                ? 'Incident Match or Evidence Sufficiency did not authorize an Evidence Link.'
+                : 'Operational Judgments did not meet Incident creation policy.',
         createdAt: evaluatedAt,
       });
       await transaction.executeSql(
@@ -1651,9 +1959,10 @@ export class PgBossTriageWorker {
         id: randomUUID(),
         triageCaseId: message.triageCaseId,
         correlationId: message.correlationId,
-        urgency: ['P0', 'P1'].includes(incident.currentPriority)
-          ? 'urgent'
-          : 'standard',
+        urgency: reviewUrgency(
+          judgments.priorityAssessment,
+          corroboratingFacts.length > 0,
+        ),
         reason:
           'Primary Owning Domain is unknown; assignment requires Operator review.',
         createdAt: evaluatedAt,

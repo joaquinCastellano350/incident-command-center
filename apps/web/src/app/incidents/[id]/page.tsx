@@ -1,5 +1,6 @@
 import { Button } from '#components/ui/button';
 import { DecisionTrace } from '#components/decision-trace';
+import { PriorityOverrideActions } from '#components/review-actions';
 import { Separator } from '#components/ui/separator';
 import { Badge } from '#components/ui/badge';
 import {
@@ -53,6 +54,14 @@ export default async function IncidentPage({
           {detail.incident.primaryOwningDomain} · {detail.incident.status}
         </p>
       </header>
+
+      {process.env.PUBLIC_DEMO_READ_ONLY !== 'true' && (
+        <PriorityOverrideActions
+          apiBaseUrl={process.env.PUBLIC_API_BASE_URL!}
+          incidentId={detail.incident.id}
+          currentPriority={detail.incident.currentPriority}
+        />
+      )}
 
       <section className="mt-8" aria-labelledby="incident-evidence-heading">
         <h2 id="incident-evidence-heading" className="text-lg font-semibold">
@@ -135,6 +144,7 @@ export default async function IncidentPage({
         policyDecision={detail.policyDecision}
         workflowActions={detail.workflowActions}
         timelineEvents={detail.timelineEvents}
+        humanOverrides={detail.humanOverrides}
       />
     </main>
   );

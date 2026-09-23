@@ -49,6 +49,7 @@ describeWithPostgres('Customer Reports at the ingestion-to-query seam', () => {
       healthSystem,
       triageSystem,
       allowedOrigin: 'http://localhost:3000',
+      operatorKey: 'test-operator-key',
       logger: false,
     });
     worker = createPostgresTriageWorker({
@@ -674,6 +675,29 @@ describeWithPostgres('Customer Reports at the ingestion-to-query seam', () => {
           item.signal.sourceReference === 'late-report',
       ),
     ).toBe(true);
+    const accepted = await api.inject({
+      method: 'POST',
+      url: `/api/v1/review-tasks/${caseId}/resolve`,
+      headers: { 'x-operator-key': 'test-operator-key' },
+      payload: {
+        actor: 'demo-operator',
+        reason: 'Confirmed this is late evidence; leave the Incident resolved.',
+        resolution: { type: 'accept_link' },
+      },
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.json().reviewTask.resolvedAt).not.toBeNull();
+    expect(accepted.json().humanOverrides[0].replacementOutcome.type).toBe(
+      'accept_link',
+    );
+    expect(
+      (
+        await api.inject({
+          method: 'GET',
+          url: `/api/v1/incidents/${incidentId}`,
+        })
+      ).json().incident.status,
+    ).toBe('resolved');
   });
 
   it('attaches one Evidence Link when two workers receive the same Signal', async () => {
@@ -838,5 +862,336 @@ describeWithPostgres('Customer Reports at the ingestion-to-query seam', () => {
     } finally {
       await secondWorker.stop();
     }
+  });
+  it('resolves low-evidence review by dismissing, creating, or linking without paging', async () => {
+    await worker.stop();
+    worker = createPostgresTriageWorker({
+      connectionString: isolatedUrl.toString(),
+      queueName,
+      clock,
+      judgmentProvider: baseline,
+    });
+    await worker.start();
+    async function vagueReport(reference: string) {
+      const response = await api.inject({
+        method: 'POST',
+        url: '/api/v1/signals/customer-reports',
+        payload: {
+          provider: 'northstar-support',
+          sourceEventKey: randomUUID(),
+          sourceReference: reference,
+          subject: 'Sign-in acting strange',
+          message: 'Sign-in has been acting strange.',
+        },
+      });
+      expect(response.statusCode).toBe(202);
+      const id = response.json().triageCase.id as string;
+      await expect
+        .poll(
+          async () =>
+            (
+              await api.inject({
+                method: 'GET',
+                url: `/api/v1/triage-cases/${id}`,
+              })
+            ).json().triageCase.status,
+          { timeout: 15_000 },
+        )
+        .toBe('needs_review');
+      return id;
+    }
+
+    const dismissedId = await vagueReport('vague-dismiss');
+    const beforeDismissal = (
+      await api.inject({
+        method: 'GET',
+        url: `/api/v1/triage-cases/${dismissedId}`,
+      })
+    ).json();
+    expect(beforeDismissal.reviewTask).toMatchObject({
+      urgency: 'standard',
+      triageCaseId: dismissedId,
+      resolvedAt: null,
+    });
+    expect(beforeDismissal.reviewTask.reason).toContain('Evidence Sufficiency');
+    expect(
+      beforeDismissal.evaluation.judgments.evidenceSufficiency.yesProbability,
+    ).toBeLessThan(0.95);
+    expect(beforeDismissal.policyDecision.authorizedActions).toEqual([]);
+    expect(beforeDismissal.workflowActions).toEqual([]);
+    expect(
+      (
+        await api.inject({
+          method: 'POST',
+          url: `/api/v1/review-tasks/${dismissedId}/resolve`,
+          payload: {
+            actor: 'demo-operator',
+            reason: 'unauthorized',
+            resolution: { type: 'dismiss' },
+          },
+        })
+      ).statusCode,
+    ).toBe(403);
+    const dismissal = await api.inject({
+      method: 'POST',
+      url: `/api/v1/review-tasks/${dismissedId}/resolve`,
+      headers: { 'x-operator-key': 'test-operator-key' },
+      payload: {
+        actor: 'demo-operator',
+        reason: 'No timing, error, or reproducible behavior.',
+        resolution: { type: 'dismiss' },
+      },
+    });
+    expect(dismissal.statusCode).toBe(200);
+    expect(dismissal.json()).toMatchObject({
+      triageCase: { status: 'dismissed' },
+      incidentId: null,
+      humanOverrides: [
+        {
+          actor: 'demo-operator',
+          reason: 'No timing, error, or reproducible behavior.',
+          replacementOutcome: { type: 'dismiss' },
+        },
+      ],
+    });
+    expect(dismissal.json().evaluation).toEqual(beforeDismissal.evaluation);
+    expect(dismissal.json().policyDecision).toEqual(
+      beforeDismissal.policyDecision,
+    );
+    expect(dismissal.json().reviewTask.resolvedAt).not.toBeNull();
+    expect(
+      (
+        await api.inject({
+          method: 'POST',
+          url: `/api/v1/review-tasks/${dismissedId}/resolve`,
+          headers: { 'x-operator-key': 'test-operator-key' },
+          payload: {
+            actor: 'demo-operator',
+            reason: 'repeat',
+            resolution: { type: 'dismiss' },
+          },
+        })
+      ).statusCode,
+    ).toBe(409);
+
+    const createdId = await vagueReport('vague-create');
+    const creation = await api.inject({
+      method: 'POST',
+      url: `/api/v1/review-tasks/${createdId}/resolve`,
+      headers: { 'x-operator-key': 'test-operator-key' },
+      payload: {
+        actor: 'demo-operator',
+        reason: 'Operator confirmed an authentication disruption.',
+        resolution: {
+          type: 'create_incident',
+          priority: 'P2',
+          owningDomain: 'authentication',
+        },
+      },
+    });
+    expect(creation.statusCode).toBe(200);
+    const created = creation.json();
+    expect(created.triageCase.status).toBe('incident_created');
+    expect(created.workflowActions).toEqual([]);
+    expect(created.humanOverrides[0].replacementOutcome.type).toBe(
+      'create_incident',
+    );
+    const incidentId = created.incidentId as string;
+    const incidentBeforePriority = (
+      await api.inject({
+        method: 'GET',
+        url: `/api/v1/incidents/${incidentId}`,
+      })
+    ).json();
+    expect(incidentBeforePriority.incident).toMatchObject({
+      status: 'open',
+      currentPriority: 'P2',
+      primaryOwningDomain: 'authentication',
+    });
+    const priority = await api.inject({
+      method: 'POST',
+      url: `/api/v1/incidents/${incidentId}/priority-override`,
+      headers: { 'x-operator-key': 'test-operator-key' },
+      payload: {
+        actor: 'demo-operator',
+        reason: 'Broader customer impact confirmed.',
+        priority: 'P1',
+      },
+    });
+    expect(priority.statusCode).toBe(200);
+    expect(priority.json().incident.currentPriority).toBe('P1');
+    expect(priority.json().humanOverrides).toHaveLength(2);
+    expect(priority.json().evaluation).toEqual(
+      incidentBeforePriority.evaluation,
+    );
+    expect(priority.json().policyDecision).toEqual(
+      incidentBeforePriority.policyDecision,
+    );
+    expect(priority.json().workflowActions).toEqual([]);
+
+    const linkedId = await vagueReport('vague-link');
+    const linking = await api.inject({
+      method: 'POST',
+      url: `/api/v1/review-tasks/${linkedId}/resolve`,
+      headers: { 'x-operator-key': 'test-operator-key' },
+      payload: {
+        actor: 'demo-operator',
+        reason: 'Operator verified the same sign-in disruption.',
+        resolution: { type: 'link_incident', incidentId },
+      },
+    });
+    expect(linking.statusCode).toBe(200);
+    expect(linking.json()).toMatchObject({
+      triageCase: { status: 'evidence_linked' },
+      incidentId,
+      evidenceLink: { incidentId },
+    });
+    expect(linking.json().workflowActions).toEqual([]);
+    const incidentAfterLink = (
+      await api.inject({
+        method: 'GET',
+        url: `/api/v1/incidents/${incidentId}`,
+      })
+    ).json();
+    expect(
+      incidentAfterLink.evidenceLinks.some(
+        (item: { signal: { sourceReference: string } }) =>
+          item.signal.sourceReference === 'vague-link',
+      ),
+    ).toBe(true);
+    expect(incidentAfterLink.incident.currentPriority).toBe('P1');
+    expect(incidentAfterLink.incident.status).toBe('open');
+    expect(incidentAfterLink.workflowActions).toEqual([]);
+
+    const reviews = (
+      await api.inject({ method: 'GET', url: '/api/v1/review-tasks' })
+    ).json().items;
+    expect(
+      reviews.map((item: { triageCase: { id: string } }) => item.triageCase.id),
+    ).not.toContain(dismissedId);
+    expect(
+      reviews.map((item: { triageCase: { id: string } }) => item.triageCase.id),
+    ).not.toContain(createdId);
+    expect(
+      reviews.map((item: { triageCase: { id: string } }) => item.triageCase.id),
+    ).not.toContain(linkedId);
+    const urgencies = reviews.map(
+      (item: { reviewTask: { urgency: string } }) => item.reviewTask.urgency,
+    );
+    expect(urgencies).toContain('urgent');
+    expect(urgencies).toContain('standard');
+    const firstStandard = urgencies.indexOf('standard');
+    if (firstStandard !== -1) {
+      expect(
+        urgencies
+          .slice(firstStandard)
+          .every((urgency: string) => urgency === 'standard'),
+      ).toBe(true);
+    }
+    for (let index = 1; index < reviews.length; index++) {
+      if (
+        reviews[index - 1].reviewTask.urgency ===
+        reviews[index].reviewTask.urgency
+      ) {
+        expect(
+          reviews[index - 1].triageCase.receivedAt <=
+            reviews[index].triageCase.receivedAt,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it('resolves an unknown Primary Owning Domain review after automatic Incident creation', async () => {
+    await worker.stop();
+    worker = createPostgresTriageWorker({
+      connectionString: isolatedUrl.toString(),
+      queueName,
+      clock,
+      judgmentProvider: {
+        async evaluate(input) {
+          const result = await baseline.evaluate(input);
+          if (input.signal.sourceType !== 'monitoring_alert') return result;
+          return {
+            ...result,
+            judgments: {
+              ...result.judgments,
+              primaryOwningDomain: {
+                choice: 'unknown' as const,
+                probabilities: [
+                  { outcome: 'payments' as const, probability: 0.0025 },
+                  { outcome: 'authentication' as const, probability: 0.0025 },
+                  { outcome: 'fulfillment' as const, probability: 0.0025 },
+                  { outcome: 'platform' as const, probability: 0.0025 },
+                  { outcome: 'unknown' as const, probability: 0.99 },
+                ],
+              },
+            },
+          };
+        },
+      },
+    });
+    await worker.start();
+    const submitted = await api.inject({
+      method: 'POST',
+      url: '/api/v1/signals/monitoring-alerts',
+      payload: {
+        provider: 'northstar-monitoring',
+        sourceEventKey: randomUUID(),
+        sourceReference: 'owner-unknown-alert',
+        metric: 'payment_authorization_failure_rate',
+        threshold: 2,
+        observedValue: 18,
+        service: 'checkout-api',
+        region: 'us-east',
+        occurredAt: clock.now().toISOString(),
+        evaluationWindowSeconds: 600,
+      },
+    });
+    expect(submitted.statusCode).toBe(202);
+    const caseId = submitted.json().triageCase.id as string;
+    await expect
+      .poll(
+        async () =>
+          (
+            await api.inject({
+              method: 'GET',
+              url: `/api/v1/triage-cases/${caseId}`,
+            })
+          ).json().reviewTask?.id,
+        { timeout: 15_000 },
+      )
+      .toBeTruthy();
+    const before = (
+      await api.inject({ method: 'GET', url: `/api/v1/triage-cases/${caseId}` })
+    ).json();
+    expect(before.triageCase.status).toBe('incident_created');
+    expect(
+      before.workflowActions.map((item: { type: string }) => item.type),
+    ).toEqual(['create_incident']);
+    const resolved = await api.inject({
+      method: 'POST',
+      url: `/api/v1/review-tasks/${caseId}/resolve`,
+      headers: { 'x-operator-key': 'test-operator-key' },
+      payload: {
+        actor: 'demo-operator',
+        reason: 'Confirmed authentication owns the first response.',
+        resolution: { type: 'assign_owner', owningDomain: 'authentication' },
+      },
+    });
+    expect(resolved.statusCode).toBe(200);
+    expect(resolved.json().reviewTask.resolvedAt).not.toBeNull();
+    expect(resolved.json().humanOverrides[0].replacementOutcome.type).toBe(
+      'assign_owner',
+    );
+    const incident = (
+      await api.inject({
+        method: 'GET',
+        url: `/api/v1/incidents/${before.incidentId}`,
+      })
+    ).json();
+    expect(incident.incident.primaryOwningDomain).toBe('authentication');
+    expect(incident.incident.status).toBe('open');
+    expect(incident.evaluation).toEqual(before.evaluation);
+    expect(incident.policyDecision).toEqual(before.policyDecision);
   });
 });

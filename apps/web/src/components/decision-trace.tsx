@@ -16,6 +16,7 @@ import type {
   Signal,
   TimelineEvent,
   WorkflowAction,
+  HumanOverride,
 } from '@incident-command-center/contracts';
 
 interface DecisionTraceProperties {
@@ -26,6 +27,7 @@ interface DecisionTraceProperties {
   policyDecision: PolicyDecision | null;
   workflowActions: WorkflowAction[];
   timelineEvents: TimelineEvent[];
+  humanOverrides?: HumanOverride[];
 }
 
 function label(value: string): string {
@@ -65,6 +67,7 @@ export function DecisionTrace({
   policyDecision,
   workflowActions,
   timelineEvents,
+  humanOverrides = [],
 }: DecisionTraceProperties) {
   const choiceJudgments = evaluation?.judgments
     ? ([
@@ -84,6 +87,7 @@ export function DecisionTrace({
         <TabsTrigger value="policy">Policy</TabsTrigger>
         <TabsTrigger value="actions">Actions</TabsTrigger>
         <TabsTrigger value="timeline">Timeline</TabsTrigger>
+        <TabsTrigger value="review">Human Review</TabsTrigger>
       </TabsList>
 
       <TabsContent value="signal" className="mt-4 space-y-4">
@@ -489,6 +493,52 @@ export function DecisionTrace({
                   </div>
                   <p className="mt-2 text-sm text-muted-foreground">
                     {event.summary}
+                  </p>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+      </TabsContent>
+
+      <TabsContent value="review" className="mt-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>Human Overrides</CardTitle>
+            <CardDescription>
+              Operator decisions preserve the original Evaluation and Policy
+              Decision.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {humanOverrides.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No Human Overrides recorded.
+              </p>
+            ) : (
+              humanOverrides.map((override) => (
+                <div key={override.id} className="rounded-md border p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="font-medium">
+                      {label(override.replacementOutcome.type)}
+                    </p>
+                    <time className="text-xs text-muted-foreground">
+                      {override.recordedAt}
+                    </time>
+                  </div>
+                  <p className="mt-2 text-sm">{override.reason}</p>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {override.actor} ·{' '}
+                    {override.replacementOutcome.type === 'set_priority' ||
+                    override.replacementOutcome.type === 'create_incident'
+                      ? `Current Priority ${override.replacementOutcome.priority}`
+                      : override.replacementOutcome.type === 'link_incident'
+                        ? `Incident ${override.replacementOutcome.incidentId}`
+                        : override.replacementOutcome.type === 'assign_owner'
+                          ? `Primary Owning Domain ${override.replacementOutcome.owningDomain}`
+                          : override.replacementOutcome.type === 'accept_link'
+                            ? 'Existing Evidence Link accepted'
+                            : 'Triage Case dismissed'}
                   </p>
                 </div>
               ))

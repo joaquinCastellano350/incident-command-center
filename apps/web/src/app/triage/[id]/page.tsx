@@ -1,6 +1,7 @@
 import { Button } from '#components/ui/button';
 import { Badge } from '#components/ui/badge';
 import { DecisionTrace } from '#components/decision-trace';
+import { ReviewActions } from '#components/review-actions';
 import { Separator } from '#components/ui/separator';
 import { TriageCaseDetailSchema } from '@incident-command-center/contracts';
 import { ArrowLeft, ExternalLink } from 'lucide-react';
@@ -76,7 +77,17 @@ export default async function TriageCasePage({
         policyDecision={detail.policyDecision}
         workflowActions={detail.workflowActions}
         timelineEvents={detail.timelineEvents}
+        humanOverrides={detail.humanOverrides}
       />
+      {detail.reviewTask &&
+        !detail.reviewTask.resolvedAt &&
+        process.env.PUBLIC_DEMO_READ_ONLY !== 'true' && (
+          <ReviewActions
+            apiBaseUrl={process.env.PUBLIC_API_BASE_URL!}
+            triageCaseId={detail.triageCase.id}
+            status={detail.triageCase.status}
+          />
+        )}
     </main>
   );
 }

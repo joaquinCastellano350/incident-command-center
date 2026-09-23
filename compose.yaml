@@ -27,6 +27,8 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: 3001
       WEB_ORIGIN: http://localhost:3000
+      OPERATOR_KEY: ${OPERATOR_KEY:-local-demo-key}
+      PUBLIC_DEMO_READ_ONLY: ${PUBLIC_DEMO_READ_ONLY:-false}
     ports:
       - '3001:3001'
     depends_on:
@@ -59,6 +61,7 @@ services:
     environment:
       API_INTERNAL_BASE_URL: http://api:3001
       PUBLIC_API_BASE_URL: http://localhost:3001
+      PUBLIC_DEMO_READ_ONLY: ${PUBLIC_DEMO_READ_ONLY:-false}
     ports:
       - '3000:3000'
     depends_on:

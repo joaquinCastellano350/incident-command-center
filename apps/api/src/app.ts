@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
 import cors from '@fastify/cors';
 import type {
@@ -17,7 +17,14 @@ import {
   MonitoringAlertIngestionResultSchema,
   TriageQueueSchema,
   TriageCaseDetailSchema,
+  ReviewQueueSchema,
+  ReviewCommandSchema,
+  PriorityOverrideCommandSchema,
 } from '@incident-command-center/contracts';
+import {
+  ReviewConflictError,
+  ReviewTargetNotFoundError,
+} from '@incident-command-center/adapters';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
@@ -26,6 +33,8 @@ interface BuildApiDependencies {
   triageSystem?: TriageSystem;
   allowedOrigin: string;
   logger?: boolean;
+  operatorKey?: string | undefined;
+  publicReadOnly?: boolean;
 }
 
 const JobParametersSchema = z.object({ id: z.uuid() });
@@ -37,9 +46,10 @@ function requestCorrelationId(header: string | string[] | undefined): string {
 
 function triageQueueEvent(
   items: Awaited<ReturnType<TriageSystem['listTriageCases']>>,
+  reviewRevision: string,
 ): string {
   const queue = TriageQueueSchema.parse({ items });
-  return `retry: 2000\nevent: triage-queue\ndata: ${JSON.stringify(queue)}\n\n`;
+  return `retry: 2000\nevent: triage-queue\ndata: ${JSON.stringify({ ...queue, reviewRevision })}\n\n`;
 }
 
 export async function buildApi({
@@ -47,6 +57,8 @@ export async function buildApi({
   triageSystem,
   allowedOrigin,
   logger = true,
+  operatorKey,
+  publicReadOnly = false,
 }: BuildApiDependencies): Promise<FastifyInstance> {
   const app = Fastify({
     logger,
@@ -58,6 +70,19 @@ export async function buildApi({
     origin: allowedOrigin,
     methods: ['GET', 'POST'],
   });
+
+  app.addHook('preHandler', async (request, reply) => {
+    if (publicReadOnly && request.method === 'POST') {
+      return reply.code(403).send({ error: 'Public demo is read-only' });
+    }
+  });
+
+  function hasOperatorAccess(provided: string | string[] | undefined): boolean {
+    if (!operatorKey || typeof provided !== 'string') return false;
+    const expectedHash = createHash('sha256').update(operatorKey).digest();
+    const providedHash = createHash('sha256').update(provided).digest();
+    return timingSafeEqual(expectedHash, providedHash);
+  }
 
   app.get('/api/v1/health', async (_request, reply) => {
     const health = HealthStatusSchema.parse(await healthSystem.readiness());
@@ -159,6 +184,59 @@ export async function buildApi({
       );
     });
 
+    app.get('/api/v1/review-tasks', async (_request, reply) => {
+      return reply.send(
+        ReviewQueueSchema.parse(await triageSystem.listReviewTasks()),
+      );
+    });
+
+    app.post('/api/v1/review-tasks/:id/resolve', async (request, reply) => {
+      if (!hasOperatorAccess(request.headers['x-operator-key'])) {
+        return reply.code(403).send({ error: 'Operator access required' });
+      }
+      const parameters = JobParametersSchema.safeParse(request.params);
+      const command = ReviewCommandSchema.safeParse(request.body);
+      if (!parameters.success || !command.success) {
+        return reply.code(400).send({ error: 'Invalid Review resolution' });
+      }
+      try {
+        const detail = await triageSystem.resolveReview(
+          parameters.data.id,
+          command.data,
+        );
+        if (!detail)
+          return reply.code(404).send({ error: 'Review Task not found' });
+        return reply.send(TriageCaseDetailSchema.parse(detail));
+      } catch (error) {
+        if (error instanceof ReviewConflictError)
+          return reply.code(409).send({ error: error.message });
+        if (error instanceof ReviewTargetNotFoundError)
+          return reply.code(404).send({ error: error.message });
+        throw error;
+      }
+    });
+
+    app.post(
+      '/api/v1/incidents/:id/priority-override',
+      async (request, reply) => {
+        if (!hasOperatorAccess(request.headers['x-operator-key'])) {
+          return reply.code(403).send({ error: 'Operator access required' });
+        }
+        const parameters = JobParametersSchema.safeParse(request.params);
+        const command = PriorityOverrideCommandSchema.safeParse(request.body);
+        if (!parameters.success || !command.success) {
+          return reply.code(400).send({ error: 'Invalid priority override' });
+        }
+        const detail = await triageSystem.overridePriority(
+          parameters.data.id,
+          command.data,
+        );
+        if (!detail)
+          return reply.code(404).send({ error: 'Incident not found' });
+        return reply.send(IncidentDetailSchema.parse(detail));
+      },
+    );
+
     app.get('/api/v1/triage-cases/:id', async (request, reply) => {
       const parameters = JobParametersSchema.safeParse(request.params);
       if (!parameters.success) {
@@ -200,7 +278,20 @@ export async function buildApi({
         if (closed || reply.raw.writableEnded) {
           return;
         }
-        const event = triageQueueEvent(await triageSystem.listTriageCases());
+        const [items, reviews] = await Promise.all([
+          triageSystem.listTriageCases(),
+          triageSystem.listReviewTasks(),
+        ]);
+        // Review-only resolutions must also advance the SSE event for the queue.
+        const event = triageQueueEvent(
+          items,
+          JSON.stringify(
+            reviews.items.map(({ reviewTask }) => [
+              reviewTask.id,
+              reviewTask.urgency,
+            ]),
+          ),
+        );
         if (event !== previousEvent) {
           previousEvent = event;
           reply.raw.write(event);

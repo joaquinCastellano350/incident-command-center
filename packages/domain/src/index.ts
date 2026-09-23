@@ -221,6 +221,24 @@ export const AUTOMATION_THRESHOLDS = {
   incidentMatchChoiceProbability: 0.97,
 } as const;
 
+export const REVIEW_URGENCY_HIGH_PRIORITY_PROBABILITY = 0.25;
+
+export function reviewUrgency(
+  priority: OperationalJudgments['priorityAssessment'] | null,
+  hasCorroboratingFact: boolean,
+  failedHighImpactAction = false,
+): 'urgent' | 'standard' {
+  const highPriorityProbability =
+    priority?.probabilities
+      .filter((item) => item.outcome === 'P0' || item.outcome === 'P1')
+      .reduce((total, item) => total + item.probability, 0) ?? 0;
+  return failedHighImpactAction ||
+    highPriorityProbability >= REVIEW_URGENCY_HIGH_PRIORITY_PROBABILITY ||
+    hasCorroboratingFact
+    ? 'urgent'
+    : 'standard';
+}
+
 function selectedProbability(judgment: {
   choice: string;
   probabilities: Array<{ outcome: string; probability: number }>;

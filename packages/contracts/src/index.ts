@@ -164,6 +164,7 @@ export const TriageCaseStatusSchema = z.enum([
   'incident_created',
   'needs_review',
   'evidence_linked',
+  'dismissed',
 ]);
 
 export const TriageCaseSchema = z.object({
@@ -396,8 +397,75 @@ export const ReviewTaskSchema = z.object({
   urgency: z.enum(['urgent', 'standard']),
   reason: z.string(),
   createdAt: z.iso.datetime(),
+  resolvedAt: z.iso.datetime().nullable().default(null),
 });
 export type ReviewTask = z.infer<typeof ReviewTaskSchema>;
+
+export const ReviewResolutionSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('create_incident'),
+    priority: z.enum(['P0', 'P1', 'P2', 'P3']),
+    owningDomain: z.enum([
+      'payments',
+      'authentication',
+      'fulfillment',
+      'platform',
+      'unknown',
+    ]),
+  }),
+  z.object({ type: z.literal('link_incident'), incidentId: z.uuid() }),
+  z.object({ type: z.literal('dismiss') }),
+  z.object({
+    type: z.literal('assign_owner'),
+    owningDomain: z.enum([
+      'payments',
+      'authentication',
+      'fulfillment',
+      'platform',
+    ]),
+  }),
+  z.object({ type: z.literal('accept_link') }),
+]);
+export const ReviewCommandSchema = z.object({
+  actor: z.literal('demo-operator'),
+  reason: z.string().trim().min(1),
+  resolution: ReviewResolutionSchema,
+});
+export type ReviewCommand = z.infer<typeof ReviewCommandSchema>;
+
+export const PriorityOverrideCommandSchema = z.object({
+  actor: z.literal('demo-operator'),
+  reason: z.string().trim().min(1),
+  priority: z.enum(['P0', 'P1', 'P2', 'P3']),
+});
+export type PriorityOverrideCommand = z.infer<
+  typeof PriorityOverrideCommandSchema
+>;
+
+export const HumanOverrideSchema = z.object({
+  id: z.uuid(),
+  triageCaseId: z.uuid(),
+  correlationId: z.uuid(),
+  actor: z.string().min(1),
+  reason: z.string().min(1),
+  recordedAt: z.iso.datetime(),
+  replacementOutcome: z.discriminatedUnion('type', [
+    ...ReviewResolutionSchema.options,
+    z.object({
+      type: z.literal('set_priority'),
+      priority: z.enum(['P0', 'P1', 'P2', 'P3']),
+      incidentId: z.uuid(),
+    }),
+  ]),
+});
+export type HumanOverride = z.infer<typeof HumanOverrideSchema>;
+
+export const ReviewQueueSchema = z.object({
+  items: z.array(
+    z.object({ reviewTask: ReviewTaskSchema, triageCase: TriageCaseSchema }),
+  ),
+});
+export type ReviewQueue = z.infer<typeof ReviewQueueSchema>;
 
 export const CorroboratingFactSchema = z.object({
   id: z.uuid(),
@@ -530,7 +598,7 @@ export const EvidenceLinkSchema = z.object({
   incidentId: z.uuid(),
   signalId: z.uuid(),
   evaluationId: z.uuid(),
-  policyDecisionId: z.uuid(),
+  policyDecisionId: z.uuid().nullable(),
   correlationId: z.uuid(),
   relationship: z.literal('same_incident'),
   createdAt: z.iso.datetime(),
@@ -563,6 +631,7 @@ export const TriageCaseDetailSchema = z.object({
   signal: SignalSchema,
   evaluation: EvaluationSchema.nullable(),
   reviewTask: ReviewTaskSchema.nullable(),
+  humanOverrides: z.array(HumanOverrideSchema).default([]),
   corroboratingFacts: z.array(CorroboratingFactSchema),
   policyDecision: PolicyDecisionSchema.nullable(),
   workflowActions: z.array(WorkflowActionSchema),
@@ -579,7 +648,8 @@ export const IncidentDetailSchema = z.object({
   evaluation: EvaluationSchema,
   reviewTask: ReviewTaskSchema.nullable(),
   corroboratingFacts: z.array(CorroboratingFactSchema),
-  policyDecision: PolicyDecisionSchema,
+  policyDecision: PolicyDecisionSchema.nullable(),
+  humanOverrides: z.array(HumanOverrideSchema).default([]),
   workflowActions: z.array(WorkflowActionSchema),
   timelineEvents: z.array(TimelineEventSchema),
   evidenceLinks: z.array(IncidentEvidenceSchema).default([]),
