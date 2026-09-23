@@ -19,15 +19,19 @@ const judgments = evaluateMonitoringAlertDeterministically({
 
 describe('candidate Incident decision gate', () => {
   it('authorizes a new Incident when no candidate matches', () => {
-    expect(decideAutomation(judgments, true, true).authorizedActions).toEqual([
-      'create_incident',
-      'assign_owner',
-      'page_on_call',
-    ]);
+    expect(
+      decideAutomation(judgments, true, {
+        outcome: 'no_match',
+        incidentId: null,
+      }).authorizedActions,
+    ).toEqual(['create_incident', 'assign_owner', 'page_on_call']);
   });
 
   it('withholds a new Incident and page when a candidate may match', () => {
-    const decision = decideAutomation(judgments, true, false);
+    const decision = decideAutomation(judgments, true, {
+      outcome: 'review',
+      incidentId: null,
+    });
     expect(decision.authorizedActions).toEqual([]);
     expect(
       decision.rules.find((rule) => rule.action === 'create_incident'),

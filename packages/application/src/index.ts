@@ -5,6 +5,8 @@ import type {
   IncidentDetail,
   DeploymentEventIngestionResult,
   DeploymentEventInput,
+  CustomerReportIngestionResult,
+  CustomerReportInput,
   MonitoringAlertIngestionResult,
   MonitoringAlertInput,
   TriageCase,
@@ -39,6 +41,10 @@ export interface HealthJobQueue {
 }
 
 export interface TriageSystem {
+  ingestCustomerReport(
+    input: CustomerReportInput,
+    correlationId: string,
+  ): Promise<CustomerReportIngestionResult>;
   ingestMonitoringAlert(
     input: MonitoringAlertInput,
     correlationId: string,

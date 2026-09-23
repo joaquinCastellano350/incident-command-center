@@ -9,6 +9,8 @@ import type {
 } from '@incident-command-center/application';
 import {
   DeploymentEventIngestionResultSchema,
+  CustomerReportIngestionResultSchema,
+  EvidenceLinkSchema,
   ActionAttemptSchema,
   AssignmentRequestSchema,
   CorroboratingFactSchema,
@@ -35,6 +37,9 @@ import {
   type HealthStatus,
   type DeploymentEventIngestionResult,
   type DeploymentEventInput,
+  type CustomerReportIngestionResult,
+  type CustomerReportInput,
+  type EvidenceLink,
   type CorroboratingFact,
   type Evaluation,
   type EvaluationInput,
@@ -56,7 +61,9 @@ import {
 } from '@incident-command-center/contracts';
 import {
   decideAutomation,
+  decideIncidentRelationship,
   evaluateDeploymentEventDeterministically,
+  evaluateCustomerReportDeterministically,
   evaluateMonitoringAlertDeterministically,
   NORTHSTAR_SERVICE_DOMAINS,
   WorkflowProviderError,
@@ -105,7 +112,7 @@ interface HealthJobRow {
 
 interface SignalRow {
   id: string;
-  source_type: 'monitoring_alert' | 'deployment_event';
+  source_type: 'monitoring_alert' | 'deployment_event' | 'customer_report';
   provider: string;
   source_event_key: string;
   source_reference: string;
@@ -126,7 +133,11 @@ interface TriageCaseRow {
   id: string;
   signal_id: string;
   status:
-    'queued' | 'ready_for_evaluation' | 'incident_created' | 'needs_review';
+    | 'queued'
+    | 'ready_for_evaluation'
+    | 'incident_created'
+    | 'needs_review'
+    | 'evidence_linked';
   source_reference: string;
   service: string;
   region: string | null;
@@ -139,7 +150,7 @@ interface NormalizedSignalDraft {
   provider: string;
   sourceEventKey: string;
   sourceReference: string;
-  occurredAt: string;
+  occurredAt: string | null;
   service: string;
   environment: string | null;
   region: string | null;
@@ -167,7 +178,7 @@ const schemaSql = `
 
   CREATE TABLE IF NOT EXISTS signals (
     id uuid PRIMARY KEY,
-    source_type text NOT NULL CHECK (source_type IN ('monitoring_alert', 'deployment_event')),
+    source_type text NOT NULL CHECK (source_type IN ('monitoring_alert', 'deployment_event', 'customer_report')),
     provider text NOT NULL,
     source_event_key text NOT NULL,
     source_reference text NOT NULL,
@@ -199,10 +210,13 @@ const schemaSql = `
   ALTER TABLE signals ALTER COLUMN title DROP NOT NULL;
   ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_source_type_check;
   ALTER TABLE signals ADD CONSTRAINT signals_source_type_check
-    CHECK (source_type IN ('monitoring_alert', 'deployment_event'));
+    CHECK (source_type IN ('monitoring_alert', 'deployment_event', 'customer_report'));
   ALTER TABLE triage_cases DROP CONSTRAINT IF EXISTS triage_cases_status_check;
   ALTER TABLE triage_cases ADD CONSTRAINT triage_cases_status_check
-    CHECK (status IN ('queued', 'ready_for_evaluation', 'incident_created', 'needs_review'));
+    CHECK (status IN ('queued', 'ready_for_evaluation', 'incident_created', 'needs_review', 'evidence_linked'));
+
+  CREATE INDEX IF NOT EXISTS signals_service_region_occurred
+    ON signals (service, region, occurred_at DESC);
 
   CREATE TABLE IF NOT EXISTS evaluations (
     id uuid PRIMARY KEY,
@@ -233,6 +247,22 @@ const schemaSql = `
     triage_case_id uuid NOT NULL UNIQUE REFERENCES triage_cases(id),
     record jsonb NOT NULL
   );
+
+  CREATE INDEX IF NOT EXISTS incidents_title_search
+    ON incidents USING gin (to_tsvector('english', coalesce(record->>'title', '')));
+  CREATE INDEX IF NOT EXISTS incidents_title_trigram
+    ON incidents USING gin ((record->>'title') gin_trgm_ops);
+
+  CREATE TABLE IF NOT EXISTS evidence_links (
+    id uuid PRIMARY KEY,
+    incident_id uuid NOT NULL REFERENCES incidents(id),
+    signal_id uuid NOT NULL UNIQUE REFERENCES signals(id),
+    triage_case_id uuid NOT NULL UNIQUE REFERENCES triage_cases(id),
+    evaluation_id uuid NOT NULL REFERENCES evaluations(id),
+    policy_decision_id uuid NOT NULL REFERENCES policy_decisions(id),
+    record jsonb NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS evidence_links_incident_id ON evidence_links (incident_id);
 
   CREATE TABLE IF NOT EXISTS workflow_actions (
     id uuid PRIMARY KEY,
@@ -784,6 +814,37 @@ export class PostgresTriageSystem implements TriageSystem {
     );
   }
 
+  async ingestCustomerReport(
+    input: CustomerReportInput,
+    correlationId: string,
+  ): Promise<CustomerReportIngestionResult> {
+    return CustomerReportIngestionResultSchema.parse(
+      await this.ingestSignal(
+        {
+          sourceType: 'customer_report',
+          provider: input.provider,
+          sourceEventKey: input.sourceEventKey,
+          sourceReference: input.sourceReference,
+          occurredAt: input.reportedAt ?? null,
+          service: input.service ?? 'unknown',
+          environment: input.environment ?? null,
+          region: input.region ?? null,
+          title: input.subject,
+          content: input.message,
+          facts: {
+            subject: input.subject,
+            message: input.message,
+            customerReference: input.customerReference ?? null,
+            affectedOperation: input.affectedOperation ?? null,
+            reportedAt: input.reportedAt ?? null,
+          },
+          rawFixtureReference: input.rawFixtureReference ?? null,
+        },
+        correlationId,
+      ),
+    );
+  }
+
   private async ingestSignal(
     input: NormalizedSignalDraft,
     correlationId: string,
@@ -817,7 +878,7 @@ export class PostgresTriageSystem implements TriageSystem {
           input.provider,
           input.sourceEventKey,
           input.sourceReference,
-          input.occurredAt,
+          input.occurredAt ?? receivedAt.toISOString(),
           receivedAt,
           input.service,
           input.environment ?? null,
@@ -913,6 +974,7 @@ export class PostgresTriageSystem implements TriageSystem {
       policyResult,
       actionResult,
       incidentResult,
+      evidenceLinkResult,
       timelineResult,
     ] = await Promise.all([
       this.pool.query<SignalRow>('SELECT * FROM signals WHERE id = $1', [
@@ -942,8 +1004,14 @@ export class PostgresTriageSystem implements TriageSystem {
         [id],
       ),
       this.pool.query<{ record: unknown }>(
+        'SELECT record FROM evidence_links WHERE triage_case_id = $1',
+        [id],
+      ),
+      this.pool.query<{ record: unknown }>(
         `SELECT record FROM timeline_events
-           WHERE incident_id = (SELECT id FROM incidents WHERE triage_case_id = $1)
+           WHERE incident_id = COALESCE(
+             (SELECT id FROM incidents WHERE triage_case_id = $1),
+             (SELECT incident_id FROM evidence_links WHERE triage_case_id = $1))
            ORDER BY CASE record->>'type'
              WHEN 'incident_created' THEN 1 WHEN 'owner_assigned' THEN 2 ELSE 3 END`,
         [id],
@@ -959,7 +1027,12 @@ export class PostgresTriageSystem implements TriageSystem {
       policyDecision: policyResult.rows[0]?.record ?? null,
       workflowActions: actionResult,
       timelineEvents: timelineResult.rows.map((row) => row.record),
-      incidentId: incidentResult.rows[0]?.id ?? null,
+      incidentId:
+        incidentResult.rows[0]?.id ??
+        (evidenceLinkResult.rows[0]?.record as EvidenceLink | undefined)
+          ?.incidentId ??
+        null,
+      evidenceLink: evidenceLinkResult.rows[0]?.record ?? null,
     });
   }
 
@@ -984,6 +1057,7 @@ export class PostgresTriageSystem implements TriageSystem {
       policyResult,
       actionResult,
       timelineResult,
+      evidenceResult,
     ] = await Promise.all([
       this.pool.query<SignalRow>('SELECT * FROM signals WHERE id = $1', [
         triageRow.signal_id,
@@ -1013,6 +1087,15 @@ export class PostgresTriageSystem implements TriageSystem {
              WHEN 'incident_created' THEN 1 WHEN 'owner_assigned' THEN 2 ELSE 3 END`,
         [id],
       ),
+      this.pool.query<SignalRow & { link: unknown; evaluation: unknown }>(
+        `SELECT l.record AS link, e.record AS evaluation, s.*
+         FROM evidence_links l
+         JOIN signals s ON s.id = l.signal_id
+         JOIN evaluations e ON e.id = l.evaluation_id
+         WHERE l.incident_id = $1
+         ORDER BY l.record->>'createdAt', l.id`,
+        [id],
+      ),
     ]);
 
     return IncidentDetailSchema.parse({
@@ -1024,6 +1107,11 @@ export class PostgresTriageSystem implements TriageSystem {
       policyDecision: policyResult.rows[0]!.record,
       workflowActions: actionResult,
       timelineEvents: timelineResult.rows.map((row) => row.record),
+      evidenceLinks: evidenceResult.rows.map((row) => ({
+        link: row.link,
+        signal: mapSignal(row),
+        evaluation: row.evaluation,
+      })),
     });
   }
 }
@@ -1058,30 +1146,53 @@ export class DeterministicOperationalJudgmentProvider implements OperationalJudg
     const signal = input.signal;
     return {
       judgments:
-        signal.sourceType === 'monitoring_alert'
-          ? evaluateMonitoringAlertDeterministically({
+        signal.sourceType === 'customer_report'
+          ? evaluateCustomerReportDeterministically({
               provider: signal.provider,
               sourceEventKey: signal.sourceEventKey,
               sourceReference: signal.sourceReference,
-              service: signal.service,
-              region: signal.region as MonitoringAlertInput['region'],
-              occurredAt: signal.occurredAt,
-              ...signal.facts,
-              ...(signal.environment
-                ? { environment: signal.environment }
+              subject: signal.facts.subject,
+              message: signal.facts.message,
+              ...(signal.facts.customerReference
+                ? { customerReference: signal.facts.customerReference }
                 : {}),
-              ...(signal.title ? { title: signal.title } : {}),
-              ...(signal.content ? { content: signal.content } : {}),
+              ...(signal.facts.affectedOperation
+                ? { affectedOperation: signal.facts.affectedOperation }
+                : {}),
+              ...(signal.facts.reportedAt
+                ? { reportedAt: signal.facts.reportedAt }
+                : {}),
+              ...(signal.service !== 'unknown'
+                ? { service: signal.service }
+                : {}),
+              ...(signal.region
+                ? { region: signal.region as CustomerReportInput['region'] }
+                : {}),
             })
-          : evaluateDeploymentEventDeterministically({
-              provider: signal.provider,
-              sourceEventKey: signal.sourceEventKey,
-              sourceReference: signal.sourceReference,
-              service: signal.service,
-              region: signal.region as DeploymentEventInput['region'],
-              occurredAt: signal.occurredAt,
-              ...signal.facts,
-            }),
+          : signal.sourceType === 'monitoring_alert'
+            ? evaluateMonitoringAlertDeterministically({
+                provider: signal.provider,
+                sourceEventKey: signal.sourceEventKey,
+                sourceReference: signal.sourceReference,
+                service: signal.service,
+                region: signal.region as MonitoringAlertInput['region'],
+                occurredAt: signal.occurredAt,
+                ...signal.facts,
+                ...(signal.environment
+                  ? { environment: signal.environment }
+                  : {}),
+                ...(signal.title ? { title: signal.title } : {}),
+                ...(signal.content ? { content: signal.content } : {}),
+              })
+            : evaluateDeploymentEventDeterministically({
+                provider: signal.provider,
+                sourceEventKey: signal.sourceEventKey,
+                sourceReference: signal.sourceReference,
+                service: signal.service,
+                region: signal.region as DeploymentEventInput['region'],
+                occurredAt: signal.occurredAt,
+                ...signal.facts,
+              }),
       incidentMatches: input.candidates.map((candidate) => ({
         candidateIncidentId: candidate.id,
         judgment: {
@@ -1196,7 +1307,21 @@ export class PgBossTriageWorker {
       }
     }
 
-    const searchText = [signal.title, signal.content, signal.sourceReference]
+    const customerReference =
+      signal.sourceType === 'customer_report'
+        ? signal.facts.customerReference
+        : null;
+    const affectedOperation =
+      signal.sourceType === 'customer_report'
+        ? signal.facts.affectedOperation
+        : null;
+    const searchText = [
+      signal.title,
+      signal.content,
+      signal.sourceReference,
+      customerReference,
+      affectedOperation,
+    ]
       .filter(Boolean)
       .join(' ');
     const knownDomain = Object.hasOwn(NORTHSTAR_SERVICE_DOMAINS, signal.service)
@@ -1212,15 +1337,34 @@ export class PgBossTriageWorker {
           OR (i.record->>'resolvedAt')::timestamptz >= $3::timestamptz - interval '24 hours'
        ORDER BY
          (CASE WHEN position(i.id::text in $4) > 0 THEN 100 ELSE 0 END
+          + CASE WHEN position(s.source_reference in $4) > 0 THEN 60 ELSE 0 END
+          + CASE WHEN $6::text IS NOT NULL AND EXISTS (
+              SELECT 1 FROM evidence_links el
+              JOIN signals linked ON linked.id = el.signal_id
+              WHERE el.incident_id = i.id
+                AND linked.facts->>'customerReference' = $6
+            ) THEN 60 ELSE 0 END
           + CASE WHEN s.service = $1 THEN 20 ELSE 0 END
           + CASE WHEN s.region = $2 THEN 10 ELSE 0 END
           + CASE WHEN i.record->>'primaryOwningDomain' = $5 THEN 8 ELSE 0 END
-          + 10 * ts_rank(to_tsvector('english', coalesce(i.record->>'title', '')),
+          + CASE WHEN s.facts->>'affectedOperation' = $7 THEN 8 ELSE 0 END
+          + 10 * ts_rank(to_tsvector('english',
+                         coalesce(i.record->>'title', '') || ' ' ||
+                         coalesce(s.title, '') || ' ' ||
+                         coalesce(s.content, '') || ' ' || s.source_reference),
                          websearch_to_tsquery('english', $4))
           + 5 * similarity(coalesce(i.record->>'title', ''), $4)) DESC,
          (i.record->>'createdAt') DESC
        LIMIT 5`,
-      [signal.service, signal.region, occurredAt, searchText, knownDomain],
+      [
+        signal.service,
+        signal.region,
+        occurredAt,
+        searchText,
+        knownDomain,
+        customerReference,
+        affectedOperation,
+      ],
     );
     const candidates = candidateResult.rows.map((row) => {
       const candidate = row as {
@@ -1321,13 +1465,14 @@ export class PgBossTriageWorker {
       incidentMatches: judgmentResult.incidentMatches,
       failure: null,
     });
-    // Until a match threshold is selected from the held-out benchmark, any
-    // retrieved candidate requires an Operator to review the relationship.
-    const noMatchConfirmed = candidates.length === 0;
+    const relationship = decideIncidentRelationship(
+      candidates.map((candidate) => candidate.id),
+      evaluation.incidentMatches,
+    );
     const automation = decideAutomation(
       judgments,
       corroboratingFacts.length > 0,
-      noMatchConfirmed,
+      relationship,
     );
     const policyDecision = PolicyDecisionSchema.parse({
       id: randomUUID(),
@@ -1357,6 +1502,71 @@ export class PgBossTriageWorker {
       [policyDecision.id, message.triageCaseId, JSON.stringify(policyDecision)],
     );
 
+    if (automation.authorizedActions.includes('create_evidence_link')) {
+      const incidentId = relationship.incidentId!;
+      const incidentResult = await transaction.executeSql(
+        'SELECT record FROM incidents WHERE id = $1 FOR UPDATE',
+        [incidentId],
+      );
+      const incident = IncidentSchema.parse(
+        (incidentResult.rows[0] as { record: unknown }).record,
+      );
+      const link = EvidenceLinkSchema.parse({
+        id: randomUUID(),
+        incidentId,
+        signalId: signal.id,
+        evaluationId: evaluation.id,
+        policyDecisionId: policyDecision.id,
+        correlationId: message.correlationId,
+        relationship: 'same_incident',
+        createdAt: evaluatedAt,
+      });
+      await transaction.executeSql(
+        `INSERT INTO evidence_links
+         (id, incident_id, signal_id, triage_case_id, evaluation_id, policy_decision_id, record)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [
+          link.id,
+          incidentId,
+          signal.id,
+          message.triageCaseId,
+          evaluation.id,
+          policyDecision.id,
+          JSON.stringify(link),
+        ],
+      );
+      await this.createAction(
+        transaction,
+        message.triageCaseId,
+        incident,
+        policyDecision,
+        'create_evidence_link',
+        'succeeded',
+        null,
+        evaluatedAt,
+      );
+      if (incident.status === 'resolved') {
+        const reviewTask = ReviewTaskSchema.parse({
+          id: randomUUID(),
+          triageCaseId: message.triageCaseId,
+          correlationId: message.correlationId,
+          urgency: 'standard',
+          reason:
+            'Evidence linked to a resolved Incident; Operator review is required.',
+          createdAt: evaluatedAt,
+        });
+        await transaction.executeSql(
+          'INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb) ON CONFLICT (triage_case_id) DO NOTHING',
+          [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
+        );
+      }
+      await transaction.executeSql(
+        "UPDATE triage_cases SET status = 'evidence_linked' WHERE id = $1 AND signal_id = $2",
+        [message.triageCaseId, signal.id],
+      );
+      return;
+    }
+
     if (!automation.authorizedActions.includes('create_incident')) {
       const reviewTask = ReviewTaskSchema.parse({
         id: randomUUID(),
@@ -1365,9 +1575,12 @@ export class PgBossTriageWorker {
         urgency: ['P0', 'P1'].includes(judgments.priorityAssessment.choice)
           ? 'urgent'
           : 'standard',
-        reason: noMatchConfirmed
-          ? 'Operational Judgments did not meet Incident creation policy.'
-          : 'A candidate Incident may match; an Operator must review the relationship.',
+        reason:
+          relationship.outcome === 'review'
+            ? 'Candidate relationship is uncertain or related but distinct; Operator review is required.'
+            : relationship.outcome === 'same_incident'
+              ? 'Incident Match or Evidence Sufficiency did not authorize an Evidence Link.'
+              : 'Operational Judgments did not meet Incident creation policy.',
         createdAt: evaluatedAt,
       });
       await transaction.executeSql(
@@ -1471,7 +1684,7 @@ export class PgBossTriageWorker {
     const idempotencyKey = `workflow:${policyDecision.version}:${policyDecision.id}:${type}`;
     const action = WorkflowActionSchema.parse({
       id: workflowActionId(idempotencyKey),
-      correlationId: incident.correlationId,
+      correlationId: policyDecision.correlationId,
       policyDecisionId: policyDecision.id,
       type,
       targetOwningDomain,
@@ -1520,9 +1733,13 @@ export class PgBossTriageWorker {
       await this.appendTimeline(
         transaction,
         incident.id,
-        incident.correlationId,
-        'incident_created',
-        'Incident created open from the authorized Policy Decision.',
+        policyDecision.correlationId,
+        type === 'create_evidence_link'
+          ? 'evidence_linked'
+          : 'incident_created',
+        type === 'create_evidence_link'
+          ? 'Customer Report linked as supporting evidence by the authorized Policy Decision.'
+          : 'Incident created open from the authorized Policy Decision.',
         occurredAt,
       );
     }

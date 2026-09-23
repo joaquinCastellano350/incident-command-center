@@ -10,6 +10,8 @@ import {
   HealthStatusSchema,
   DeploymentEventInputSchema,
   DeploymentEventIngestionResultSchema,
+  CustomerReportInputSchema,
+  CustomerReportIngestionResultSchema,
   IncidentDetailSchema,
   MonitoringAlertInputSchema,
   MonitoringAlertIngestionResultSchema,
@@ -92,6 +94,23 @@ export async function buildApi({
   });
 
   if (triageSystem) {
+    app.post('/api/v1/signals/customer-reports', async (request, reply) => {
+      const input = CustomerReportInputSchema.safeParse(request.body);
+      if (!input.success) {
+        return reply.code(400).send({
+          error: 'Invalid Customer Report',
+          issues: input.error.issues,
+        });
+      }
+      const correlationId = z.uuid().parse(request.id);
+      const result = CustomerReportIngestionResultSchema.parse(
+        await triageSystem.ingestCustomerReport(input.data, correlationId),
+      );
+      return reply
+        .header('location', `/api/v1/triage-cases/${result.triageCase.id}`)
+        .code(result.deduplicated ? 200 : 202)
+        .send(result);
+    });
     app.post('/api/v1/signals/deployment-events', async (request, reply) => {
       const input = DeploymentEventInputSchema.safeParse(request.body);
       if (!input.success) {

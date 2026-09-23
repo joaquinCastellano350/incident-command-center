@@ -78,6 +78,32 @@ export const DeploymentEventInputSchema = z
 
 export type DeploymentEventInput = z.infer<typeof DeploymentEventInputSchema>;
 
+export const CustomerReportInputSchema = z
+  .object({
+    provider: z.string().trim().min(1),
+    sourceEventKey: z.string().trim().min(1),
+    sourceReference: z.string().trim().min(1),
+    subject: z.string().trim().min(1),
+    message: z.string().trim().min(1),
+    customerReference: z.string().trim().min(1).optional(),
+    affectedOperation: z.string().trim().min(1).optional(),
+    reportedAt: z.iso.datetime().optional(),
+    service: z.string().trim().min(1).optional(),
+    region: z.enum(['us-east', 'eu-west', 'sa-east']).optional(),
+    environment: z.string().trim().min(1).optional(),
+    rawFixtureReference: z.string().trim().min(1).optional(),
+  })
+  .strict();
+export type CustomerReportInput = z.infer<typeof CustomerReportInputSchema>;
+
+export const CustomerReportFactsSchema = z.object({
+  subject: z.string().min(1),
+  message: z.string().min(1),
+  customerReference: z.string().nullable(),
+  affectedOperation: z.string().nullable(),
+  reportedAt: z.iso.datetime().nullable(),
+});
+
 export const MonitoringAlertFactsSchema = z.object({
   metric: z.string(),
   threshold: z.number(),
@@ -119,9 +145,15 @@ export const DeploymentEventSignalSchema = SignalEnvelopeSchema.extend({
   facts: DeploymentEventFactsSchema,
 });
 
+export const CustomerReportSignalSchema = SignalEnvelopeSchema.extend({
+  sourceType: z.literal('customer_report'),
+  facts: CustomerReportFactsSchema,
+});
+
 export const SignalSchema = z.discriminatedUnion('sourceType', [
   MonitoringAlertSignalSchema,
   DeploymentEventSignalSchema,
+  CustomerReportSignalSchema,
 ]);
 
 export type Signal = z.infer<typeof SignalSchema>;
@@ -131,6 +163,7 @@ export const TriageCaseStatusSchema = z.enum([
   'ready_for_evaluation',
   'incident_created',
   'needs_review',
+  'evidence_linked',
 ]);
 
 export const TriageCaseSchema = z.object({
@@ -164,6 +197,15 @@ export const DeploymentEventIngestionResultSchema = z.object({
 
 export type DeploymentEventIngestionResult = z.infer<
   typeof DeploymentEventIngestionResultSchema
+>;
+
+export const CustomerReportIngestionResultSchema = z.object({
+  signal: CustomerReportSignalSchema,
+  triageCase: TriageCaseSchema,
+  deduplicated: z.boolean(),
+});
+export type CustomerReportIngestionResult = z.infer<
+  typeof CustomerReportIngestionResultSchema
 >;
 
 const probability = z.number().min(0).max(1);
@@ -370,6 +412,7 @@ export const WorkflowActionTypeSchema = z.enum([
   'create_incident',
   'assign_owner',
   'page_on_call',
+  'create_evidence_link',
 ]);
 
 export type WorkflowActionType = z.infer<typeof WorkflowActionTypeSchema>;
@@ -395,6 +438,7 @@ export const PolicyDecisionSchema = z.object({
     impactChoiceProbability: probability,
     ownershipChoiceProbability: probability,
     evidenceSufficiencyYesProbability: probability,
+    incidentMatchChoiceProbability: probability.optional(),
   }),
   rules: z.array(PolicyRuleResultSchema),
   authorizedActions: z.array(WorkflowActionTypeSchema),
@@ -481,10 +525,33 @@ export const IncidentSchema = z
 
 export type Incident = z.infer<typeof IncidentSchema>;
 
+export const EvidenceLinkSchema = z.object({
+  id: z.uuid(),
+  incidentId: z.uuid(),
+  signalId: z.uuid(),
+  evaluationId: z.uuid(),
+  policyDecisionId: z.uuid(),
+  correlationId: z.uuid(),
+  relationship: z.literal('same_incident'),
+  createdAt: z.iso.datetime(),
+});
+export type EvidenceLink = z.infer<typeof EvidenceLinkSchema>;
+
+export const IncidentEvidenceSchema = z.object({
+  link: EvidenceLinkSchema,
+  signal: SignalSchema,
+  evaluation: EvaluationSchema,
+});
+
 export const TimelineEventSchema = z.object({
   id: z.uuid(),
   correlationId: z.uuid(),
-  type: z.enum(['incident_created', 'owner_assigned', 'on_call_paged']),
+  type: z.enum([
+    'incident_created',
+    'owner_assigned',
+    'on_call_paged',
+    'evidence_linked',
+  ]),
   occurredAt: z.iso.datetime(),
   summary: z.string(),
 });
@@ -501,6 +568,7 @@ export const TriageCaseDetailSchema = z.object({
   workflowActions: z.array(WorkflowActionSchema),
   timelineEvents: z.array(TimelineEventSchema),
   incidentId: z.uuid().nullable(),
+  evidenceLink: EvidenceLinkSchema.nullable().default(null),
 });
 
 export type TriageCaseDetail = z.infer<typeof TriageCaseDetailSchema>;
@@ -514,6 +582,7 @@ export const IncidentDetailSchema = z.object({
   policyDecision: PolicyDecisionSchema,
   workflowActions: z.array(WorkflowActionSchema),
   timelineEvents: z.array(TimelineEventSchema),
+  evidenceLinks: z.array(IncidentEvidenceSchema).default([]),
 });
 
 export type IncidentDetail = z.infer<typeof IncidentDetailSchema>;

@@ -1,6 +1,7 @@
 import type {
   MonitoringAlertInput,
   DeploymentEventInput,
+  CustomerReportInput,
   OperationalJudgments,
   PolicyRuleResult,
   WorkflowActionType,
@@ -171,6 +172,41 @@ export function evaluateDeploymentEventDeterministically(
   };
 }
 
+export function evaluateCustomerReportDeterministically(
+  signal: CustomerReportInput,
+): OperationalJudgments {
+  const owner =
+    signal.service && Object.hasOwn(NORTHSTAR_SERVICE_DOMAINS, signal.service)
+      ? NORTHSTAR_SERVICE_DOMAINS[
+          signal.service as keyof typeof NORTHSTAR_SERVICE_DOMAINS
+        ]
+      : 'unknown';
+  return {
+    priorityAssessment: distribution('P3', ['P0', 'P1', 'P2', 'P3'], 0.7),
+    customerReach: distribution(
+      'unknown',
+      ['single', 'subset', 'widespread', 'unknown'],
+      0.7,
+    ),
+    regionalReach: distribution(
+      signal.region ? 'single_region' : 'unknown',
+      ['single_region', 'multi_region', 'global', 'not_applicable', 'unknown'],
+      0.7,
+    ),
+    serviceBreadth: distribution(
+      'unknown',
+      ['single_service', 'multi_service', 'platform_wide', 'unknown'],
+      0.7,
+    ),
+    primaryOwningDomain: distribution(
+      owner,
+      ['payments', 'authentication', 'fulfillment', 'platform', 'unknown'],
+      owner === 'unknown' ? 0.7 : 0.8,
+    ),
+    evidenceSufficiency: { yesProbability: 0.75 },
+  };
+}
+
 export interface AutomationDecision {
   rules: PolicyRuleResult[];
   authorizedActions: WorkflowActionType[];
@@ -182,6 +218,7 @@ export const AUTOMATION_THRESHOLDS = {
   impactChoiceProbability: 0.95,
   ownershipChoiceProbability: 0.95,
   evidenceSufficiencyYesProbability: 0.95,
+  incidentMatchChoiceProbability: 0.97,
 } as const;
 
 function selectedProbability(judgment: {
@@ -195,10 +232,53 @@ function selectedProbability(judgment: {
   );
 }
 
+export type IncidentRelationshipDecision =
+  | { outcome: 'same_incident'; incidentId: string }
+  | { outcome: 'no_match' | 'review'; incidentId: null };
+
+export function decideIncidentRelationship(
+  candidateIds: string[],
+  matches: OperationalJudgmentResult<OperationalJudgments>['incidentMatches'],
+): IncidentRelationshipDecision {
+  if (
+    candidateIds.length !== matches.length ||
+    new Set(matches.map((match) => match.candidateIncidentId)).size !==
+      candidateIds.length ||
+    matches.some((match) => !candidateIds.includes(match.candidateIncidentId))
+  ) {
+    return { outcome: 'review', incidentId: null };
+  }
+  const confidentSame = matches.filter(
+    (match) =>
+      match.judgment.choice === 'same_incident' &&
+      selectedProbability(match.judgment) >=
+        AUTOMATION_THRESHOLDS.incidentMatchChoiceProbability,
+  );
+  const confidentUnrelated = matches.filter(
+    (match) =>
+      match.judgment.choice === 'unrelated' &&
+      selectedProbability(match.judgment) >=
+        AUTOMATION_THRESHOLDS.incidentMatchChoiceProbability,
+  );
+  if (
+    confidentSame.length === 1 &&
+    confidentUnrelated.length === matches.length - 1
+  ) {
+    return {
+      outcome: 'same_incident',
+      incidentId: confidentSame[0]!.candidateIncidentId,
+    };
+  }
+  if (confidentUnrelated.length === matches.length) {
+    return { outcome: 'no_match', incidentId: null };
+  }
+  return { outcome: 'review', incidentId: null };
+}
+
 export function decideAutomation(
   judgments: OperationalJudgments,
   hasCorroboratingFact: boolean,
-  noMatchConfirmed = true,
+  relationship: IncidentRelationshipDecision,
 ): AutomationDecision {
   const priority = judgments.priorityAssessment.choice;
   const owner = judgments.primaryOwningDomain.choice;
@@ -230,12 +310,14 @@ export function decideAutomation(
     sufficientEvidence &&
     knownImpact &&
     confidentImpact &&
-    noMatchConfirmed;
+    relationship.outcome === 'no_match';
   const assignOwner = createIncident && owner !== 'unknown' && confidentOwner;
   const pageOnCall =
     assignOwner &&
     (priority === 'P0' || priority === 'P1') &&
     hasCorroboratingFact;
+  const createEvidenceLink =
+    relationship.outcome === 'same_incident' && sufficientEvidence;
   const rules: PolicyRuleResult[] = [
     {
       ruleId: 'incident-creation-evidence-and-impact',
@@ -260,6 +342,14 @@ export function decideAutomation(
       explanation: pageOnCall
         ? 'P0/P1 priority at 0.95 probability, ownership at 0.95 probability, Evidence Sufficiency at 0.95, and a Corroborating Fact authorize paging.'
         : 'Paging requires P0/P1 priority at 0.95 probability, ownership at 0.95 probability, Evidence Sufficiency at 0.95, and a Corroborating Fact.',
+    },
+    {
+      ruleId: 'evidence-link-confident-match',
+      action: 'create_evidence_link',
+      outcome: createEvidenceLink ? 'authorized' : 'denied',
+      explanation: createEvidenceLink
+        ? 'One candidate is a confident same Incident match and Evidence Sufficiency is at least 0.95.'
+        : 'Evidence Link requires one confident same Incident match and Evidence Sufficiency of at least 0.95.',
     },
   ];
 

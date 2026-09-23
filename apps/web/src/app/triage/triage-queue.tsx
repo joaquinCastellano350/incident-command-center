@@ -49,6 +49,7 @@ function statusLabel(status: TriageCase['status']): string {
   if (status === 'queued') return 'Queued';
   if (status === 'incident_created') return 'Incident created';
   if (status === 'needs_review') return 'Needs review';
+  if (status === 'evidence_linked') return 'Evidence linked';
   return 'Ready for evaluation';
 }
 

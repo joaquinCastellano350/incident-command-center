@@ -38,7 +38,7 @@ function label(value: string): string {
 function facts(signal: Signal): Array<[string, string]> {
   return Object.entries(signal.facts).map(([key, value]) => [
     label(key),
-    String(value),
+    value === null ? 'Unknown' : String(value),
   ]);
 }
 
@@ -308,6 +308,13 @@ export function DecisionTrace({
                   label="Evidence Sufficiency"
                   value={`${policyDecision.thresholds.evidenceSufficiencyYesProbability * 100}%`}
                 />
+                {policyDecision.thresholds.incidentMatchChoiceProbability !==
+                  undefined && (
+                  <Detail
+                    label="Incident Match probability"
+                    value={`${policyDecision.thresholds.incidentMatchChoiceProbability * 100}%`}
+                  />
+                )}
               </div>
             )}
             {policyDecision?.rules.map((rule) => (
