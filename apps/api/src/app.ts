@@ -20,6 +20,7 @@ import {
   ReviewQueueSchema,
   ReviewCommandSchema,
   PriorityOverrideCommandSchema,
+  ReevaluationCommandSchema,
 } from '@incident-command-center/contracts';
 import {
   ReviewConflictError,
@@ -250,6 +251,34 @@ export async function buildApi({
       }
       return reply.send(TriageCaseDetailSchema.parse(detail));
     });
+
+    app.post(
+      '/api/v1/triage-cases/:id/reevaluations',
+      async (request, reply) => {
+        if (!hasOperatorAccess(request.headers['x-operator-key']))
+          return reply.code(403).send({ error: 'Operator access required' });
+        const parameters = JobParametersSchema.safeParse(request.params);
+        const command = ReevaluationCommandSchema.safeParse(request.body);
+        if (!parameters.success || !command.success)
+          return reply
+            .code(400)
+            .send({ error: 'Invalid Re-evaluation request' });
+        try {
+          const detail = await triageSystem.requestReevaluation(
+            parameters.data.id,
+            command.data,
+            z.uuid().parse(request.id),
+          );
+          if (!detail)
+            return reply.code(404).send({ error: 'Triage Case not found' });
+          return reply.code(202).send(TriageCaseDetailSchema.parse(detail));
+        } catch (error) {
+          if (error instanceof ReviewConflictError)
+            return reply.code(409).send({ error: error.message });
+          throw error;
+        }
+      },
+    );
 
     app.get('/api/v1/incidents/:id', async (request, reply) => {
       const parameters = JobParametersSchema.safeParse(request.params);

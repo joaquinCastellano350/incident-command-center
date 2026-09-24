@@ -7,6 +7,7 @@ import {
   createPostgresHealthSystem,
   createPostgresTriageSystem,
   createPostgresTriageWorker,
+  JevOperationalJudgmentProvider,
 } from '@incident-command-center/adapters';
 import {
   MonitoringAlertIngestionResultSchema,
@@ -158,6 +159,76 @@ try {
       2,
     ),
   );
+  if (process.argv.includes('--outage')) {
+    await worker.stop();
+    let providerAttempts = 0;
+    worker = createPostgresTriageWorker({
+      connectionString: drillUrl.toString(),
+      queueName,
+      clock,
+      judgmentProvider: new JevOperationalJudgmentProvider(
+        {
+          async send() {
+            providerAttempts++;
+            return {
+              status: 503,
+              body: {},
+              requestId: `outage-${providerAttempts}`,
+            };
+          },
+        },
+        'live',
+      ),
+    });
+    await worker.start();
+    const outageResponse = await api.inject({
+      method: 'POST',
+      url: '/api/v1/signals/monitoring-alerts',
+      payload: {
+        ...payload,
+        sourceEventKey: `${payload.sourceEventKey}-outage`,
+      },
+    });
+    if (outageResponse.statusCode !== 202) throw new Error(outageResponse.body);
+    const outageCase = MonitoringAlertIngestionResultSchema.parse(
+      outageResponse.json(),
+    );
+    let failed: Awaited<ReturnType<typeof detail>> | null = null;
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const current = await detail(outageCase.triageCase.id);
+      if (current.evaluation?.status === 'failed') {
+        failed = current;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (
+      !failed ||
+      providerAttempts !== 3 ||
+      failed.evaluation?.attempts.length !== 3 ||
+      !failed.reviewTask ||
+      failed.policyDecision ||
+      failed.workflowActions.length > 0
+    ) {
+      throw new Error(
+        'Outage drill did not stop after bounded retries and route to Review Task',
+      );
+    }
+    console.log(
+      JSON.stringify(
+        {
+          outageTriageCaseId: outageCase.triageCase.id,
+          providerAttempts,
+          evaluation: failed.evaluation,
+          reviewTask: failed.reviewTask,
+          workflowActions: failed.workflowActions,
+        },
+        null,
+        2,
+      ),
+    );
+  }
 } finally {
   await api?.close();
   await worker?.stop();

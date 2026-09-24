@@ -5,6 +5,8 @@ import type {
   OperationalJudgments,
   PolicyRuleResult,
   WorkflowActionType,
+  EvaluationAttempt,
+  Incident,
 } from '@incident-command-center/contracts';
 
 export interface Clock {
@@ -59,10 +61,14 @@ export interface OperationalJudgmentResult<TJudgments> {
   outputTokens: number;
   latencyMs: number;
   retryCount: number;
+  attempts?: EvaluationAttempt[];
 }
 
 export interface OperationalJudgmentProviderPort<TSignal, TJudgments> {
-  evaluate(signal: TSignal): Promise<OperationalJudgmentResult<TJudgments>>;
+  evaluate(
+    signal: TSignal,
+    onAttempt?: (attempt: EvaluationAttempt) => Promise<void>,
+  ): Promise<OperationalJudgmentResult<TJudgments>>;
 }
 
 function distribution<const TChoices extends readonly string[]>(
@@ -210,7 +216,7 @@ export function evaluateCustomerReportDeterministically(
 export interface AutomationDecision {
   rules: PolicyRuleResult[];
   authorizedActions: WorkflowActionType[];
-  thresholds: typeof AUTOMATION_THRESHOLDS;
+  thresholds: AutomationThresholds;
 }
 
 export const AUTOMATION_THRESHOLDS = {
@@ -220,6 +226,13 @@ export const AUTOMATION_THRESHOLDS = {
   evidenceSufficiencyYesProbability: 0.95,
   incidentMatchChoiceProbability: 0.97,
 } as const;
+export type AutomationThresholds = {
+  [K in keyof typeof AUTOMATION_THRESHOLDS]: number;
+};
+export const CAUTIOUS_AUTOMATION_THRESHOLDS: AutomationThresholds = {
+  ...AUTOMATION_THRESHOLDS,
+  evidenceSufficiencyYesProbability: 0.98,
+};
 
 export const REVIEW_URGENCY_HIGH_PRIORITY_PROBABILITY = 0.25;
 
@@ -297,15 +310,16 @@ export function decideAutomation(
   judgments: OperationalJudgments,
   hasCorroboratingFact: boolean,
   relationship: IncidentRelationshipDecision,
+  thresholds: AutomationThresholds = AUTOMATION_THRESHOLDS,
 ): AutomationDecision {
   const priority = judgments.priorityAssessment.choice;
   const owner = judgments.primaryOwningDomain.choice;
   const sufficientEvidence =
     judgments.evidenceSufficiency.yesProbability >=
-    AUTOMATION_THRESHOLDS.evidenceSufficiencyYesProbability;
+    thresholds.evidenceSufficiencyYesProbability;
   const confidentPriority =
     selectedProbability(judgments.priorityAssessment) >=
-    AUTOMATION_THRESHOLDS.priorityChoiceProbability;
+    thresholds.priorityChoiceProbability;
   const knownImpact =
     judgments.customerReach.choice !== 'unknown' &&
     judgments.regionalReach.choice !== 'unknown' &&
@@ -316,12 +330,11 @@ export function decideAutomation(
     judgments.serviceBreadth,
   ].every(
     (judgment) =>
-      selectedProbability(judgment) >=
-      AUTOMATION_THRESHOLDS.impactChoiceProbability,
+      selectedProbability(judgment) >= thresholds.impactChoiceProbability,
   );
   const confidentOwner =
     selectedProbability(judgments.primaryOwningDomain) >=
-    AUTOMATION_THRESHOLDS.ownershipChoiceProbability;
+    thresholds.ownershipChoiceProbability;
   const createIncident =
     priority !== 'P3' &&
     confidentPriority &&
@@ -342,8 +355,8 @@ export function decideAutomation(
       action: 'create_incident',
       outcome: createIncident ? 'authorized' : 'denied',
       explanation: createIncident
-        ? 'Priority and impact Choice probabilities are at least 0.95, all impact dimensions are known, Evidence Sufficiency is at least 0.95, and no candidate Incident matches.'
-        : 'Incident creation requires non-minor priority at 0.95 probability, known impact dimensions at 0.95 probability, Evidence Sufficiency of at least 0.95, and confident no-match across candidate Incidents.',
+        ? `Priority and impact Choice probabilities meet thresholds, all impact dimensions are known, Evidence Sufficiency is at least ${thresholds.evidenceSufficiencyYesProbability}, and no candidate Incident matches.`
+        : `Incident creation requires non-minor priority and known impact dimensions at their thresholds, Evidence Sufficiency of at least ${thresholds.evidenceSufficiencyYesProbability}, and confident no-match across candidate Incidents.`,
     },
     {
       ruleId: 'assignment-known-primary-domain',
@@ -358,22 +371,102 @@ export function decideAutomation(
       action: 'page_on_call',
       outcome: pageOnCall ? 'authorized' : 'denied',
       explanation: pageOnCall
-        ? 'P0/P1 priority at 0.95 probability, ownership at 0.95 probability, Evidence Sufficiency at 0.95, and a Corroborating Fact authorize paging.'
-        : 'Paging requires P0/P1 priority at 0.95 probability, ownership at 0.95 probability, Evidence Sufficiency at 0.95, and a Corroborating Fact.',
+        ? `P0/P1 priority and ownership meet thresholds, Evidence Sufficiency is at least ${thresholds.evidenceSufficiencyYesProbability}, and a Corroborating Fact exists.`
+        : `Paging requires P0/P1 priority, known ownership, Evidence Sufficiency at ${thresholds.evidenceSufficiencyYesProbability}, and a Corroborating Fact.`,
     },
     {
       ruleId: 'evidence-link-confident-match',
       action: 'create_evidence_link',
       outcome: createEvidenceLink ? 'authorized' : 'denied',
       explanation: createEvidenceLink
-        ? 'One candidate is a confident same Incident match and Evidence Sufficiency is at least 0.95.'
-        : 'Evidence Link requires one confident same Incident match and Evidence Sufficiency of at least 0.95.',
+        ? `One candidate is a confident same Incident match and Evidence Sufficiency is at least ${thresholds.evidenceSufficiencyYesProbability}.`
+        : `Evidence Link requires one confident same Incident match and Evidence Sufficiency of at least ${thresholds.evidenceSufficiencyYesProbability}.`,
     },
   ];
 
   return {
     rules,
-    thresholds: AUTOMATION_THRESHOLDS,
+    thresholds,
+    authorizedActions: rules
+      .filter((rule) => rule.outcome === 'authorized')
+      .map((rule) => rule.action),
+  };
+}
+
+export function decideExistingIncidentAutomation(
+  judgments: OperationalJudgments,
+  hasCorroboratingFact: boolean,
+  incident: Pick<
+    Incident,
+    'currentPriority' | 'status' | 'primaryOwningDomain'
+  >,
+  priorEffects: { assignmentFailed: boolean; pageAttempted: boolean },
+  thresholds: AutomationThresholds = AUTOMATION_THRESHOLDS,
+): AutomationDecision {
+  const owner = judgments.primaryOwningDomain.choice;
+  const active = incident.status !== 'resolved';
+  const confidentOwner =
+    owner !== 'unknown' &&
+    selectedProbability(judgments.primaryOwningDomain) >=
+      thresholds.ownershipChoiceProbability;
+  const ownerAlreadyAssigned = incident.primaryOwningDomain === owner;
+  const ownershipConflict =
+    incident.primaryOwningDomain !== 'unknown' && !ownerAlreadyAssigned;
+  const assignOwner =
+    active &&
+    confidentOwner &&
+    incident.primaryOwningDomain === 'unknown' &&
+    !priorEffects.assignmentFailed;
+  const pageOnCall =
+    active &&
+    confidentOwner &&
+    !ownershipConflict &&
+    !priorEffects.assignmentFailed &&
+    !priorEffects.pageAttempted &&
+    (ownerAlreadyAssigned || assignOwner) &&
+    (incident.currentPriority === 'P0' || incident.currentPriority === 'P1') &&
+    judgments.evidenceSufficiency.yesProbability >=
+      thresholds.evidenceSufficiencyYesProbability &&
+    hasCorroboratingFact;
+  const rules: PolicyRuleResult[] = [
+    {
+      ruleId: 'existing-incident-not-recreated',
+      action: 'create_incident',
+      outcome: 'denied',
+      explanation: 'The Triage Case already has an Incident.',
+    },
+    {
+      ruleId: 'existing-incident-owner',
+      action: 'assign_owner',
+      outcome: assignOwner ? 'authorized' : 'denied',
+      explanation: assignOwner
+        ? `Primary Owning Domain is ${owner} with at least 0.95 probability.`
+        : ownershipConflict
+          ? 'A different Domain already owns the Incident; reassignment requires Operator review.'
+          : priorEffects.assignmentFailed
+            ? 'A previous assignment failed permanently; Operator review is required.'
+            : 'Assignment is already complete or requires a known Primary Owning Domain at 0.95 probability.',
+    },
+    {
+      ruleId: 'existing-incident-page',
+      action: 'page_on_call',
+      outcome: pageOnCall ? 'authorized' : 'denied',
+      explanation: pageOnCall
+        ? `Current Priority is P0/P1, ownership meets its threshold, Evidence Sufficiency is at least ${thresholds.evidenceSufficiencyYesProbability}, and a Corroborating Fact exists.`
+        : priorEffects.pageAttempted
+          ? 'A prior page was already attempted; no duplicate automatic page is authorized.'
+          : `Paging requires P0/P1 Current Priority, non-conflicting ownership at 0.95 probability, Evidence Sufficiency at ${thresholds.evidenceSufficiencyYesProbability}, and a Corroborating Fact.`,
+    },
+    {
+      ruleId: 'existing-signal-not-relinked',
+      action: 'create_evidence_link',
+      outcome: 'denied',
+      explanation: 'The original Signal remains attached to its Incident.',
+    },
+  ];
+  return {
+    rules,
+    thresholds,
     authorizedActions: rules
       .filter((rule) => rule.outcome === 'authorized')
       .map((rule) => rule.action),

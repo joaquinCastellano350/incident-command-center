@@ -283,6 +283,11 @@ export type CandidateIncident = z.infer<typeof CandidateIncidentSchema>;
 
 export const EvaluationInputSchema = z.object({
   signal: SignalSchema,
+  additionalEvidence: z.string().nullable().default(null),
+  requestedModel: z.string().nullable().default(null),
+  questionSetVersion: z
+    .enum(['northstar-triage.v1', 'northstar-triage.v2'])
+    .default('northstar-triage.v1'),
   corroboratingFacts: z.array(
     z.object({
       kind: z.string(),
@@ -327,6 +332,24 @@ export const OperationalJudgmentsSchema = z.object({
 
 export type OperationalJudgments = z.infer<typeof OperationalJudgmentsSchema>;
 
+export const EvaluationAttemptSchema = z.object({
+  id: z.uuid(),
+  sequence: z.number().int().positive(),
+  providerRequestId: z.string().nullable(),
+  outcome: z.enum([
+    'succeeded',
+    'connection',
+    'timeout',
+    'rate_limit',
+    'server',
+    'invalid_response',
+    'provider',
+    'deadline',
+  ]),
+  latencyMs: z.number().nonnegative(),
+});
+export type EvaluationAttempt = z.infer<typeof EvaluationAttemptSchema>;
+
 export const EvaluationSchema = z
   .object({
     id: z.uuid(),
@@ -341,14 +364,18 @@ export const EvaluationSchema = z
     resolvedModel: z.string().min(1),
     normalizationVersion: z.literal(1),
     decisionSchemaVersion: z.literal('operational-judgments.v1'),
-    questionSetVersion: z.literal('northstar-triage.v1'),
-    policyVersion: z.literal('northstar-automation.v1'),
+    questionSetVersion: z.enum(['northstar-triage.v1', 'northstar-triage.v2']),
+    policyVersion: z.enum([
+      'northstar-automation.v1',
+      'northstar-automation.v2',
+    ]),
     attemptId: z.uuid(),
     providerRequestId: z.string().nullable(),
     inputTokens: z.number().int().nonnegative(),
     outputTokens: z.number().int().nonnegative(),
     latencyMs: z.number().nonnegative(),
     retryCount: z.number().int().nonnegative(),
+    attempts: z.array(EvaluationAttemptSchema).default([]),
     evaluatedAt: z.iso.datetime(),
     judgments: OperationalJudgmentsSchema.nullable(),
     incidentMatches: z
@@ -361,7 +388,15 @@ export const EvaluationSchema = z
       .default([]),
     failure: z
       .object({
-        kind: z.enum(['deadline', 'provider', 'invalid_response']),
+        kind: z.enum([
+          'deadline',
+          'connection',
+          'timeout',
+          'rate_limit',
+          'server',
+          'provider',
+          'invalid_response',
+        ]),
         message: z.string(),
       })
       .nullable()
@@ -389,6 +424,52 @@ export const EvaluationSchema = z
   });
 
 export type Evaluation = z.infer<typeof EvaluationSchema>;
+
+export const EvaluationProgressSchema = z.object({
+  id: z.uuid(),
+  triageCaseId: z.uuid(),
+  previousEvaluationId: z.uuid().nullable(),
+  status: z.enum(['pending', 'retrying', 'failed', 'completed']),
+  attempts: z.array(EvaluationAttemptSchema),
+  requestedAt: z.iso.datetime(),
+  requestedBy: z.string().nullable(),
+  reason: z.string().nullable(),
+  additionalEvidence: z.string().nullable(),
+  requestedModel: z.string().nullable(),
+  requestedQuestionSetVersion: z.string().nullable(),
+  requestedPolicyVersion: z.string().nullable(),
+});
+export type EvaluationProgress = z.infer<typeof EvaluationProgressSchema>;
+
+export const ReevaluationCommandSchema = z
+  .object({
+    actor: z.literal('demo-operator'),
+    reason: z.string().trim().min(1),
+    additionalEvidence: z.string().trim().min(1).max(4000).optional(),
+    modelVersion: z
+      .string()
+      .regex(/^jev-\d+\.\d+\.\d+$/)
+      .optional(),
+    questionSetVersion: z
+      .enum(['northstar-triage.v1', 'northstar-triage.v2'])
+      .optional(),
+    policyVersion: z
+      .enum(['northstar-automation.v1', 'northstar-automation.v2'])
+      .optional(),
+  })
+  .refine(
+    (command) =>
+      Boolean(
+        command.additionalEvidence ||
+        command.modelVersion ||
+        command.questionSetVersion ||
+        command.policyVersion,
+      ),
+    {
+      message: 'New evidence or a version selection is required',
+    },
+  );
+export type ReevaluationCommand = z.infer<typeof ReevaluationCommandSchema>;
 
 export const ReviewTaskSchema = z.object({
   id: z.uuid(),
@@ -425,6 +506,7 @@ export const ReviewResolutionSchema = z.discriminatedUnion('type', [
     ]),
   }),
   z.object({ type: z.literal('accept_link') }),
+  z.object({ type: z.literal('accept_incident') }),
 ]);
 export const ReviewCommandSchema = z.object({
   actor: z.literal('demo-operator'),
@@ -500,7 +582,7 @@ export const PolicyDecisionSchema = z.object({
   evaluationId: z.uuid(),
   supersedesPolicyDecisionId: z.uuid().nullable(),
   correlationId: z.uuid(),
-  version: z.literal('northstar-automation.v1'),
+  version: z.enum(['northstar-automation.v1', 'northstar-automation.v2']),
   thresholds: z.object({
     priorityChoiceProbability: probability,
     impactChoiceProbability: probability,
@@ -630,6 +712,10 @@ export const TriageCaseDetailSchema = z.object({
   triageCase: TriageCaseSchema,
   signal: SignalSchema,
   evaluation: EvaluationSchema.nullable(),
+  evaluationHistory: z.array(EvaluationSchema).default([]),
+  evaluationProgress: EvaluationProgressSchema.nullable().default(null),
+  evaluationProgressHistory: z.array(EvaluationProgressSchema).default([]),
+  policyDecisionHistory: z.array(PolicyDecisionSchema).default([]),
   reviewTask: ReviewTaskSchema.nullable(),
   humanOverrides: z.array(HumanOverrideSchema).default([]),
   corroboratingFacts: z.array(CorroboratingFactSchema),
@@ -707,6 +793,7 @@ export const TriageJobMessageV1Schema = z.object({
   version: z.literal(1),
   triageCaseId: z.uuid(),
   signalId: z.uuid(),
+  evaluationProgressId: z.uuid().optional(),
   correlationId: z.uuid(),
 });
 

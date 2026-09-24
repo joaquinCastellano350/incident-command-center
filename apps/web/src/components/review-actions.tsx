@@ -34,7 +34,7 @@ export function ReviewActions({
   const router = useRouter();
   const [action, setAction] = useState<ReviewCommand['resolution']['type']>(
     status === 'incident_created'
-      ? 'assign_owner'
+      ? 'accept_incident'
       : status === 'evidence_linked'
         ? 'accept_link'
         : 'dismiss',
@@ -138,9 +138,14 @@ export function ReviewActions({
                 </>
               )}
               {status === 'incident_created' && (
-                <NativeSelectOption value="assign_owner">
-                  Assign Primary Owning Domain
-                </NativeSelectOption>
+                <>
+                  <NativeSelectOption value="accept_incident">
+                    Accept existing Incident
+                  </NativeSelectOption>
+                  <NativeSelectOption value="assign_owner">
+                    Set Primary Owning Domain
+                  </NativeSelectOption>
+                </>
               )}
               {status === 'evidence_linked' && (
                 <NativeSelectOption value="accept_link">

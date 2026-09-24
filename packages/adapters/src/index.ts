@@ -15,6 +15,8 @@ import {
   AssignmentRequestSchema,
   CorroboratingFactSchema,
   EvaluationSchema,
+  EvaluationInputSchema,
+  EvaluationProgressSchema,
   ReviewTaskSchema,
   HumanOverrideSchema,
   HealthCheckJobSchema,
@@ -43,6 +45,8 @@ import {
   type EvidenceLink,
   type CorroboratingFact,
   type Evaluation,
+  type EvaluationAttempt,
+  type EvaluationProgress,
   type EvaluationInput,
   type Incident,
   type IncidentDetail,
@@ -58,6 +62,7 @@ import {
   type ReviewQueue,
   type ReviewCommand,
   type PriorityOverrideCommand,
+  type ReevaluationCommand,
   type TimelineEvent,
   type WorkflowAction,
   type WorkflowActionDefinition,
@@ -65,6 +70,8 @@ import {
 } from '@incident-command-center/contracts';
 import {
   decideAutomation,
+  decideExistingIncidentAutomation,
+  CAUTIOUS_AUTOMATION_THRESHOLDS,
   decideIncidentRelationship,
   evaluateDeploymentEventDeterministically,
   evaluateCustomerReportDeterministically,
@@ -90,6 +97,7 @@ export {
   RecordedJevTransport,
   JEV_MODEL,
   JEV_QUESTION_SET_VERSION,
+  JEV_QUESTION_SET_VERSION_V2,
 } from './jev.js';
 
 export const HEALTH_CHECK_QUEUE = 'system-health-check';
@@ -106,6 +114,20 @@ function workflowActionId(key: string): string {
   bytes[8] = (bytes[8]! & 0x3f) | 0x80;
   const hex = bytes.toString('hex');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function isNewerNumberedVersion(next: string, previous: string): boolean {
+  return Number(next.split('.v').at(-1)) > Number(previous.split('.v').at(-1));
+}
+
+function isNewerJevModel(next: string, previous: string): boolean {
+  const parse = (value: string) => value.slice(4).split('.').map(Number);
+  const nextParts = parse(next);
+  const previousParts = parse(previous);
+  const differing = nextParts.findIndex(
+    (part, index) => part !== previousParts[index],
+  );
+  return differing >= 0 && nextParts[differing]! > previousParts[differing]!;
 }
 
 interface HealthJobRow {
@@ -231,6 +253,26 @@ const schemaSql = `
     triage_case_id uuid NOT NULL REFERENCES triage_cases(id),
     record jsonb NOT NULL
   );
+  ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS sequence bigserial;
+  CREATE TABLE IF NOT EXISTS evaluation_progress (
+    id uuid PRIMARY KEY,
+    sequence bigserial,
+    triage_case_id uuid NOT NULL REFERENCES triage_cases(id),
+    previous_evaluation_id uuid REFERENCES evaluations(id),
+    additional_evidence text,
+    requested_model text,
+    requested_question_set text,
+    requested_policy text,
+    requested_by text,
+    reason text,
+    status text NOT NULL CHECK (status IN ('pending', 'retrying', 'failed', 'completed')),
+    attempts jsonb NOT NULL DEFAULT '[]'::jsonb,
+    requested_at timestamptz NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS evaluation_progress_case_requested
+    ON evaluation_progress (triage_case_id, sequence DESC);
+  ALTER TABLE evaluation_progress ADD COLUMN IF NOT EXISTS requested_question_set text;
+  ALTER TABLE evaluation_progress ADD COLUMN IF NOT EXISTS requested_policy text;
 
   CREATE TABLE IF NOT EXISTS review_tasks (
     id uuid PRIMARY KEY,
@@ -249,6 +291,7 @@ const schemaSql = `
     triage_case_id uuid NOT NULL REFERENCES triage_cases(id),
     record jsonb NOT NULL
   );
+  ALTER TABLE policy_decisions ADD COLUMN IF NOT EXISTS sequence bigserial;
 
   CREATE TABLE IF NOT EXISTS incidents (
     id uuid PRIMARY KEY,
@@ -947,8 +990,21 @@ export class PostgresTriageSystem implements TriageSystem {
         ],
       );
 
+      await client.query(
+        `INSERT INTO evaluation_progress
+         (id, triage_case_id, previous_evaluation_id, additional_evidence, status, requested_at)
+         VALUES ($1, $2, NULL, NULL, 'pending', $3)`,
+        [triageCaseId, triageCaseId, receivedAt],
+      );
+
       await this.queue.enqueue(
-        { version: 1, triageCaseId, signalId, correlationId },
+        {
+          version: 1,
+          triageCaseId,
+          signalId,
+          correlationId,
+          evaluationProgressId: triageCaseId,
+        },
         { id: triageCaseId, transaction: clientDatabase(client) },
       );
       await client.query('COMMIT');
@@ -992,6 +1048,127 @@ export class PostgresTriageSystem implements TriageSystem {
     };
   }
 
+  async requestReevaluation(
+    id: string,
+    command: ReevaluationCommand,
+    correlationId: string,
+  ): Promise<TriageCaseDetail | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const caseResult = await client.query<TriageCaseRow>(
+        'SELECT * FROM triage_cases WHERE id = $1 FOR UPDATE',
+        [id],
+      );
+      const triageCase = caseResult.rows[0];
+      if (!triageCase) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const previous = await client.query<{ id: string; record: Evaluation }>(
+        'SELECT id, record FROM evaluations WHERE triage_case_id = $1 ORDER BY sequence DESC LIMIT 1',
+        [id],
+      );
+      if (!previous.rows[0])
+        throw new ReviewConflictError(
+          'Triage Case has no completed Evaluation',
+        );
+      const previousEvaluation = EvaluationSchema.parse(
+        previous.rows[0].record,
+      );
+      const nextQuestionSet =
+        command.questionSetVersion ?? previousEvaluation.questionSetVersion;
+      const nextPolicy =
+        command.policyVersion ?? previousEvaluation.policyVersion;
+      const nextModel =
+        command.modelVersion ?? previousEvaluation.configuredModel;
+      if (
+        command.questionSetVersion &&
+        !isNewerNumberedVersion(
+          nextQuestionSet,
+          previousEvaluation.questionSetVersion,
+        )
+      ) {
+        throw new ReviewConflictError(
+          'Question set must be newer than the previous Evaluation',
+        );
+      }
+      if (
+        command.policyVersion &&
+        !isNewerNumberedVersion(nextPolicy, previousEvaluation.policyVersion)
+      ) {
+        throw new ReviewConflictError(
+          'Policy must be newer than the previous Evaluation',
+        );
+      }
+      if (
+        command.modelVersion &&
+        /^jev-\d+\.\d+\.\d+$/.test(previousEvaluation.configuredModel) &&
+        !isNewerJevModel(
+          command.modelVersion,
+          previousEvaluation.configuredModel,
+        )
+      ) {
+        throw new ReviewConflictError(
+          'Jev model must be newer than the previous Evaluation',
+        );
+      }
+      if (
+        !command.additionalEvidence &&
+        !command.modelVersion &&
+        !command.questionSetVersion &&
+        !command.policyVersion
+      ) {
+        throw new ReviewConflictError(
+          'Re-evaluation requires new evidence or a newer version',
+        );
+      }
+      const active = await client.query(
+        "SELECT 1 FROM evaluation_progress WHERE triage_case_id = $1 AND status IN ('pending', 'retrying') LIMIT 1",
+        [id],
+      );
+      if (active.rows[0])
+        throw new ReviewConflictError('An Evaluation is already in progress');
+      const progressId = randomUUID();
+      await client.query(
+        `INSERT INTO evaluation_progress
+         (id, triage_case_id, previous_evaluation_id, additional_evidence,
+          requested_model, requested_question_set, requested_policy,
+          requested_by, reason, status, requested_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10)`,
+        [
+          progressId,
+          id,
+          previous.rows[0].id,
+          command.additionalEvidence,
+          nextModel.startsWith('jev-') ? nextModel : null,
+          nextQuestionSet,
+          nextPolicy,
+          command.actor,
+          command.reason,
+          this.clock.now(),
+        ],
+      );
+      await this.queue.enqueue(
+        {
+          version: 1,
+          triageCaseId: id,
+          signalId: triageCase.signal_id,
+          correlationId,
+          evaluationProgressId: progressId,
+        },
+        { id: progressId, transaction: clientDatabase(client) },
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.findTriageCase(id);
+  }
+
   async resolveReview(
     id: string,
     command: ReviewCommand,
@@ -1022,7 +1199,7 @@ export class PostgresTriageSystem implements TriageSystem {
         triageCase.status === 'needs_review'
           ? ['create_incident', 'link_incident', 'dismiss']
           : triageCase.status === 'incident_created'
-            ? ['assign_owner']
+            ? ['assign_owner', 'accept_incident']
             : triageCase.status === 'evidence_linked'
               ? ['accept_link']
               : [];
@@ -1138,8 +1315,10 @@ export class PostgresTriageSystem implements TriageSystem {
         const incidentRow = result.rows[0];
         if (!incidentRow) throw new ReviewConflictError('Incident is missing');
         const incident = IncidentSchema.parse(incidentRow.record);
-        if (incident.primaryOwningDomain !== 'unknown') {
-          throw new ReviewConflictError('Incident already has an owner');
+        if (incident.primaryOwningDomain === command.resolution.owningDomain) {
+          throw new ReviewConflictError(
+            'Incident already has this owner; accept the existing Incident instead',
+          );
         }
         incidentId = incident.id;
         await client.query(
@@ -1151,12 +1330,20 @@ export class PostgresTriageSystem implements TriageSystem {
           correlationId: triageCase.correlation_id,
           type: 'owner_assigned',
           occurredAt: timestamp,
-          summary: `Operator ${command.actor} assigned ${command.resolution.owningDomain} after review.`,
+          summary: `Operator ${command.actor} set Primary Owning Domain to ${command.resolution.owningDomain} after review.`,
         });
         await client.query(
           'INSERT INTO timeline_events (id, incident_id, record) VALUES ($1, $2, $3::jsonb)',
           [event.id, incidentId, JSON.stringify(event)],
         );
+      } else if (command.resolution.type === 'accept_incident') {
+        const result = await client.query<{ id: string }>(
+          'SELECT id FROM incidents WHERE triage_case_id = $1 FOR UPDATE',
+          [id],
+        );
+        if (!result.rows[0])
+          throw new ReviewConflictError('Incident is missing');
+        incidentId = result.rows[0].id;
       } else if (command.resolution.type === 'accept_link') {
         const result = await client.query<{ incident_id: string }>(
           'SELECT incident_id FROM evidence_links WHERE triage_case_id = $1',
@@ -1259,6 +1446,7 @@ export class PostgresTriageSystem implements TriageSystem {
     const [
       signalResult,
       evaluationResult,
+      progressResult,
       reviewResult,
       overrideResult,
       factResult,
@@ -1273,7 +1461,26 @@ export class PostgresTriageSystem implements TriageSystem {
       ]),
       this.pool.query<{ record: unknown }>(
         `SELECT record FROM evaluations WHERE triage_case_id = $1
-           ORDER BY record->>'evaluatedAt' DESC LIMIT 1`,
+           ORDER BY sequence`,
+        [id],
+      ),
+      this.pool.query<{
+        id: string;
+        previous_evaluation_id: string | null;
+        status: EvaluationProgress['status'];
+        attempts: EvaluationAttempt[];
+        requested_at: Date;
+        requested_by: string | null;
+        reason: string | null;
+        additional_evidence: string | null;
+        requested_model: string | null;
+        requested_question_set: string | null;
+        requested_policy: string | null;
+      }>(
+        `SELECT id, previous_evaluation_id, status, attempts, requested_at,
+                requested_by, reason, additional_evidence, requested_model,
+                requested_question_set, requested_policy
+         FROM evaluation_progress WHERE triage_case_id = $1 ORDER BY sequence`,
         [id],
       ),
       this.pool.query<{ record: unknown }>(
@@ -1291,7 +1498,7 @@ export class PostgresTriageSystem implements TriageSystem {
       ),
       this.pool.query<{ record: unknown }>(
         `SELECT record FROM policy_decisions WHERE triage_case_id = $1
-           ORDER BY record->>'decidedAt' DESC LIMIT 1`,
+           ORDER BY sequence`,
         [id],
       ),
       loadWorkflowActions(this.pool, 'triage_case_id', id),
@@ -1314,14 +1521,34 @@ export class PostgresTriageSystem implements TriageSystem {
       ),
     ]);
 
+    const evaluationProgressHistory = progressResult.rows.map((row) =>
+      EvaluationProgressSchema.parse({
+        id: row.id,
+        triageCaseId: id,
+        previousEvaluationId: row.previous_evaluation_id,
+        status: row.status,
+        attempts: row.attempts,
+        requestedAt: row.requested_at.toISOString(),
+        requestedBy: row.requested_by,
+        reason: row.reason,
+        additionalEvidence: row.additional_evidence,
+        requestedModel: row.requested_model,
+        requestedQuestionSetVersion: row.requested_question_set,
+        requestedPolicyVersion: row.requested_policy,
+      }),
+    );
     return TriageCaseDetailSchema.parse({
       triageCase: mapTriageCase(triageRow),
       signal: mapSignal(signalResult.rows[0]!),
-      evaluation: evaluationResult.rows[0]?.record ?? null,
+      evaluation: evaluationResult.rows.at(-1)?.record ?? null,
+      evaluationHistory: evaluationResult.rows.map((row) => row.record),
+      evaluationProgress: evaluationProgressHistory.at(-1) ?? null,
+      evaluationProgressHistory,
       reviewTask: reviewResult.rows[0]?.record ?? null,
       humanOverrides: overrideResult.rows.map((row) => row.record),
       corroboratingFacts: factResult.rows.map((row) => row.record),
-      policyDecision: policyResult.rows[0]?.record ?? null,
+      policyDecision: policyResult.rows.at(-1)?.record ?? null,
+      policyDecisionHistory: policyResult.rows.map((row) => row.record),
       workflowActions: actionResult,
       timelineEvents: timelineResult.rows.map((row) => row.record),
       incidentId:
@@ -1566,12 +1793,44 @@ export class PgBossTriageWorker {
       TRIAGE_MATCH_LOCK,
     ]);
 
+    const progressResult = await transaction.executeSql(
+      `SELECT previous_evaluation_id, requested_model,
+              requested_question_set, requested_policy, status,
+         (SELECT string_agg(p.additional_evidence, chr(10) ORDER BY p.sequence)
+          FROM evaluation_progress p WHERE p.triage_case_id = $2) AS additional_evidence
+       FROM evaluation_progress WHERE id = $1 AND triage_case_id = $2`,
+      [
+        message.evaluationProgressId ?? message.triageCaseId,
+        message.triageCaseId,
+      ],
+    );
+    const progress = progressResult.rows[0] as
+      | {
+          previous_evaluation_id: string | null;
+          additional_evidence: string | null;
+          requested_model: string | null;
+          requested_question_set: string | null;
+          requested_policy: string | null;
+          status: EvaluationProgress['status'];
+        }
+      | undefined;
+    if (
+      !progress ||
+      progress.status === 'completed' ||
+      progress.status === 'failed'
+    )
+      return;
+    const previousEvaluationId = progress.previous_evaluation_id;
+    const questionSetVersion =
+      progress.requested_question_set ?? JEV_QUESTION_SET_VERSION;
+    const policyVersion =
+      progress.requested_policy ?? 'northstar-automation.v1';
     const completedResult = await transaction.executeSql(
       `SELECT 1 FROM policy_decisions WHERE triage_case_id = $1
        UNION ALL SELECT 1 FROM review_tasks WHERE triage_case_id = $1 LIMIT 1`,
       [message.triageCaseId],
     );
-    if (completedResult.rows.length > 0) return;
+    if (!previousEvaluationId && completedResult.rows.length > 0) return;
 
     const occurredAt = new Date(signal.occurredAt);
     const corroboratingFacts: CorroboratingFact[] = [];
@@ -1689,32 +1948,68 @@ export class PgBossTriageWorker {
     });
     let judgmentResult: OperationalJudgmentResult<OperationalJudgments>;
     try {
-      judgmentResult = await this.judgmentProvider.evaluate({
-        signal,
-        corroboratingFacts: corroboratingFacts.map(
-          ({ kind, summary, evidenceSignalIds }) => ({
-            kind,
-            summary,
-            evidenceSignalIds,
-          }),
-        ),
-        candidates,
-      });
+      judgmentResult = await this.judgmentProvider.evaluate(
+        EvaluationInputSchema.parse({
+          signal,
+          additionalEvidence: progress.additional_evidence,
+          requestedModel: progress.requested_model,
+          questionSetVersion,
+          corroboratingFacts: corroboratingFacts.map(
+            ({ kind, summary, evidenceSignalIds }) => ({
+              kind,
+              summary,
+              evidenceSignalIds,
+            }),
+          ),
+          candidates,
+        }),
+        async (attempt) => {
+          await this.pool.query(
+            `UPDATE evaluation_progress SET attempts = attempts || $2::jsonb,
+             status = 'retrying' WHERE id = $1`,
+            [
+              message.evaluationProgressId ?? message.triageCaseId,
+              JSON.stringify([attempt]),
+            ],
+          );
+        },
+      );
+      if (
+        progress.requested_model &&
+        judgmentResult.configuredModel !== progress.requested_model
+      ) {
+        throw new JevEvaluationFailure(
+          'invalid_response',
+          'Requested Jev model version was not used by the provider',
+          {
+            mode: judgmentResult.mode,
+            configuredModel: progress.requested_model,
+            resolvedModel: judgmentResult.resolvedModel,
+            providerRequestId: judgmentResult.providerRequestId,
+            inputTokens: judgmentResult.inputTokens,
+            outputTokens: judgmentResult.outputTokens,
+            latencyMs: judgmentResult.latencyMs,
+            retryCount: judgmentResult.retryCount,
+            attempts: judgmentResult.attempts ?? [],
+          },
+        );
+      }
     } catch (error) {
       if (!(error instanceof JevEvaluationFailure)) throw error;
       const evaluatedAt = this.clock.now().toISOString();
       const evaluation = EvaluationSchema.parse({
         id: randomUUID(),
         triageCaseId: message.triageCaseId,
-        previousEvaluationId: null,
+        previousEvaluationId,
         correlationId: message.correlationId,
         status: 'failed',
         ...error.metadata,
         normalizationVersion: 1,
         decisionSchemaVersion: 'operational-judgments.v1',
-        questionSetVersion: JEV_QUESTION_SET_VERSION,
-        policyVersion: 'northstar-automation.v1',
-        attemptId: randomUUID(),
+        questionSetVersion,
+        policyVersion,
+        attemptId: error.metadata.attempts.at(-1)?.id ?? randomUUID(),
+        attempts: error.metadata.attempts,
         evaluatedAt,
         judgments: null,
         incidentMatches: [],
@@ -1733,11 +2028,20 @@ export class PgBossTriageWorker {
         [evaluation.id, message.triageCaseId, JSON.stringify(evaluation)],
       );
       await transaction.executeSql(
-        'INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb) ON CONFLICT (triage_case_id) DO NOTHING',
+        "UPDATE evaluation_progress SET status = 'failed', attempts = $2::jsonb WHERE id = $1",
+        [
+          message.evaluationProgressId ?? message.triageCaseId,
+          JSON.stringify(evaluation.attempts),
+        ],
+      );
+      await transaction.executeSql(
+        `INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)
+         ON CONFLICT (triage_case_id) DO UPDATE SET
+           record = jsonb_set(EXCLUDED.record, '{id}', to_jsonb(review_tasks.id::text))`,
         [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
       );
       await transaction.executeSql(
-        "UPDATE triage_cases SET status = 'needs_review' WHERE id = $1",
+        "UPDATE triage_cases SET status = 'needs_review' WHERE id = $1 AND status NOT IN ('incident_created', 'evidence_linked')",
         [message.triageCaseId],
       );
       return;
@@ -1748,7 +2052,7 @@ export class PgBossTriageWorker {
     const evaluation = EvaluationSchema.parse({
       id: randomUUID(),
       triageCaseId: message.triageCaseId,
-      previousEvaluationId: null,
+      previousEvaluationId,
       correlationId: message.correlationId,
       status: 'succeeded',
       mode: judgmentResult.mode,
@@ -1756,9 +2060,10 @@ export class PgBossTriageWorker {
       resolvedModel: judgmentResult.resolvedModel,
       normalizationVersion: 1,
       decisionSchemaVersion: 'operational-judgments.v1',
-      questionSetVersion: JEV_QUESTION_SET_VERSION,
-      policyVersion: 'northstar-automation.v1',
-      attemptId: randomUUID(),
+      questionSetVersion,
+      policyVersion,
+      attemptId: judgmentResult.attempts?.at(-1)?.id ?? randomUUID(),
+      attempts: judgmentResult.attempts ?? [],
       providerRequestId: judgmentResult.providerRequestId,
       inputTokens: judgmentResult.inputTokens,
       outputTokens: judgmentResult.outputTokens,
@@ -1773,18 +2078,70 @@ export class PgBossTriageWorker {
       candidates.map((candidate) => candidate.id),
       evaluation.incidentMatches,
     );
-    const automation = decideAutomation(
-      judgments,
-      corroboratingFacts.length > 0,
-      relationship,
+    const priorEffectResult = previousEvaluationId
+      ? await transaction.executeSql(
+          `SELECT i.record AS incident, l.id AS link_id
+           FROM triage_cases t
+           LEFT JOIN incidents i ON i.triage_case_id = t.id
+           LEFT JOIN evidence_links l ON l.triage_case_id = t.id
+           WHERE t.id = $1`,
+          [message.triageCaseId],
+        )
+      : null;
+    const priorEffect = priorEffectResult?.rows[0] as
+      { incident: unknown | null; link_id: string | null } | undefined;
+    const existingIncident = priorEffect?.incident
+      ? IncidentSchema.parse(priorEffect.incident)
+      : null;
+    const priorActions = existingIncident
+      ? await transaction.executeSql(
+          `SELECT w.record->>'type' AS type, l.status
+           FROM workflow_actions w JOIN effects_ledger l ON l.action_id = w.id
+           WHERE w.incident_id = $1`,
+          [existingIncident.id],
+        )
+      : null;
+    const used = new Map(
+      (priorActions?.rows ?? []).map((row) => {
+        const action = row as { type: string; status: string };
+        return [action.type, action.status] as const;
+      }),
+    );
+    const priorEffects = {
+      assignmentFailed: used.get('assign_owner') === 'permanently_failed',
+      pageAttempted: used.has('page_on_call'),
+    };
+    const thresholds =
+      policyVersion === 'northstar-automation.v2'
+        ? CAUTIOUS_AUTOMATION_THRESHOLDS
+        : undefined;
+    const automation = existingIncident
+      ? decideExistingIncidentAutomation(
+          judgments,
+          corroboratingFacts.length > 0,
+          existingIncident,
+          priorEffects,
+          thresholds,
+        )
+      : decideAutomation(
+          judgments,
+          corroboratingFacts.length > 0,
+          relationship,
+          thresholds,
+        );
+    const previousPolicyResult = await transaction.executeSql(
+      'SELECT id FROM policy_decisions WHERE triage_case_id = $1 ORDER BY sequence DESC LIMIT 1',
+      [message.triageCaseId],
     );
     const policyDecision = PolicyDecisionSchema.parse({
       id: randomUUID(),
       triageCaseId: message.triageCaseId,
       evaluationId: evaluation.id,
-      supersedesPolicyDecisionId: null,
+      supersedesPolicyDecisionId:
+        (previousPolicyResult.rows[0] as { id: string } | undefined)?.id ??
+        null,
       correlationId: message.correlationId,
-      version: 'northstar-automation.v1',
+      version: policyVersion,
       thresholds: automation.thresholds,
       rules: automation.rules,
       authorizedActions: automation.authorizedActions,
@@ -1795,7 +2152,14 @@ export class PgBossTriageWorker {
       'INSERT INTO evaluations (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)',
       [evaluation.id, message.triageCaseId, JSON.stringify(evaluation)],
     );
-    for (const fact of corroboratingFacts) {
+    await transaction.executeSql(
+      "UPDATE evaluation_progress SET status = 'completed', attempts = $2::jsonb WHERE id = $1",
+      [
+        message.evaluationProgressId ?? message.triageCaseId,
+        JSON.stringify(evaluation.attempts),
+      ],
+    );
+    for (const fact of previousEvaluationId ? [] : corroboratingFacts) {
       await transaction.executeSql(
         'INSERT INTO corroborating_facts (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)',
         [fact.id, message.triageCaseId, JSON.stringify(fact)],
@@ -1805,6 +2169,102 @@ export class PgBossTriageWorker {
       'INSERT INTO policy_decisions (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)',
       [policyDecision.id, message.triageCaseId, JSON.stringify(policyDecision)],
     );
+
+    if (
+      previousEvaluationId &&
+      automation.authorizedActions.some((action) =>
+        ['create_incident', 'create_evidence_link', 'assign_owner'].includes(
+          action,
+        ),
+      )
+    ) {
+      await transaction.executeSql(
+        `UPDATE review_tasks SET record = jsonb_set(record, '{resolvedAt}', to_jsonb($2::text))
+         WHERE triage_case_id = $1 AND record->>'resolvedAt' IS NULL`,
+        [message.triageCaseId, evaluatedAt],
+      );
+    }
+
+    if (previousEvaluationId) {
+      if (existingIncident) {
+        const incident = existingIncident;
+        if (incident.status !== 'resolved') {
+          const ownershipConflict =
+            incident.primaryOwningDomain !== 'unknown' &&
+            incident.primaryOwningDomain !==
+              judgments.primaryOwningDomain.choice;
+          if (ownershipConflict || priorEffects.assignmentFailed) {
+            const reviewTask = ReviewTaskSchema.parse({
+              id: randomUUID(),
+              triageCaseId: message.triageCaseId,
+              correlationId: message.correlationId,
+              urgency: reviewUrgency(
+                judgments.priorityAssessment,
+                corroboratingFacts.length > 0,
+              ),
+              reason: ownershipConflict
+                ? 'Primary Owning Domain conflicts with the existing assignment; Operator review is required.'
+                : 'The previous assignment failed permanently; Operator review is required.',
+              createdAt: evaluatedAt,
+            });
+            await transaction.executeSql(
+              `INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)
+               ON CONFLICT (triage_case_id) DO UPDATE SET record =
+                 jsonb_set(EXCLUDED.record, '{id}', to_jsonb(review_tasks.id::text))`,
+              [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
+            );
+          }
+          if (
+            automation.authorizedActions.includes('assign_owner') &&
+            !used.has('assign_owner')
+          ) {
+            const assignment = await this.createAction(
+              transaction,
+              message.triageCaseId,
+              incident,
+              policyDecision,
+              'assign_owner',
+              'pending',
+              judgments.primaryOwningDomain
+                .choice as AssignmentRequest['owningDomain'],
+              evaluatedAt,
+            );
+            await this.enqueueAction(transaction, assignment);
+          }
+          const assignmentStatus = used.get('assign_owner');
+          const assignmentCanComplete = assignmentStatus
+            ? ['pending', 'executing', 'retry_scheduled'].includes(
+                assignmentStatus,
+              )
+            : automation.authorizedActions.includes('assign_owner');
+          const ownerAlreadyAssigned =
+            incident.primaryOwningDomain ===
+            judgments.primaryOwningDomain.choice;
+          if (
+            automation.authorizedActions.includes('page_on_call') &&
+            !used.has('page_on_call') &&
+            (assignmentCanComplete || ownerAlreadyAssigned)
+          ) {
+            const page = await this.createAction(
+              transaction,
+              message.triageCaseId,
+              incident,
+              policyDecision,
+              'page_on_call',
+              'pending',
+              judgments.primaryOwningDomain
+                .choice as PageRequest['owningDomain'],
+              evaluatedAt,
+            );
+            if (ownerAlreadyAssigned) {
+              await this.enqueueAction(transaction, page);
+            }
+          }
+        }
+        return;
+      }
+      if (priorEffect?.link_id) return;
+    }
 
     if (automation.authorizedActions.includes('create_evidence_link')) {
       const incidentId = relationship.incidentId!;

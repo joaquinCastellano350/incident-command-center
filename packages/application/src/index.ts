@@ -15,6 +15,7 @@ import type {
   ReviewQueue,
   ReviewCommand,
   PriorityOverrideCommand,
+  ReevaluationCommand,
 } from '@incident-command-center/contracts';
 
 export interface HealthSystem {
@@ -68,6 +69,11 @@ export interface TriageSystem {
     id: string,
     command: PriorityOverrideCommand,
   ): Promise<IncidentDetail | null>;
+  requestReevaluation(
+    id: string,
+    command: ReevaluationCommand,
+    correlationId: string,
+  ): Promise<TriageCaseDetail | null>;
 }
 
 export interface TriageJobQueue {

@@ -254,6 +254,34 @@ describe('TypeSafe Jev contract', () => {
     });
   });
 
+  it('does not replay a stale recording for new operator evidence', async () => {
+    const body = JSON.parse(
+      await readFile('apps/worker/recordings/canonical-p1.json', 'utf8'),
+    )[0].body;
+    const transport = new RecordedJevTransport({
+      body,
+      requestId: 'recorded:old-evidence',
+      expectedSignal: {
+        sourceType: 'monitoring_alert',
+        service: fixture.signal.service,
+        region: fixture.signal.region,
+        facts: {
+          metric: 'payment_authorization_failure_rate',
+          threshold: 2,
+          observedValue: 18,
+        },
+      },
+      expectedCandidateIds: [fixture.candidates[0]!.id],
+      expectedCorroboratingKinds: ['threshold_breach'],
+    });
+    await expect(
+      new JevOperationalJudgmentProvider(transport, 'recorded').evaluate({
+        ...fixture,
+        additionalEvidence: 'New customer evidence',
+      }),
+    ).rejects.toMatchObject({ kind: 'provider', metadata: { retryCount: 0 } });
+  });
+
   it('rejects an incomplete distribution as an invalid provider result', async () => {
     const response = JSON.parse(
       await readFile('apps/worker/recordings/canonical-p1.json', 'utf8'),
@@ -299,4 +327,89 @@ describe('TypeSafe Jev contract', () => {
     } satisfies Partial<JevEvaluationFailure>);
     expect(performance.now() - start).toBeLessThan(500);
   });
+
+  it('bounds a transport that ignores abort and records every timed attempt', async () => {
+    const transport: JevTransport = {
+      async send() {
+        return new Promise(() => undefined);
+      },
+    };
+    const start = performance.now();
+    await expect(
+      new JevOperationalJudgmentProvider(
+        transport,
+        'live',
+        'jev-1.13.0',
+        40,
+      ).evaluate(fixture),
+    ).rejects.toMatchObject({
+      kind: 'deadline',
+      metadata: {
+        retryCount: 0,
+        attempts: [{ sequence: 1, outcome: 'deadline' }],
+      },
+    });
+    expect(performance.now() - start).toBeLessThan(500);
+  });
+
+  it('normalizes retryable HTTP failures and records each provider request', async () => {
+    let count = 0;
+    const transport: JevTransport = {
+      async send() {
+        count++;
+        return { status: 429, body: {}, requestId: `rate-${count}` };
+      },
+    };
+    await expect(
+      new JevOperationalJudgmentProvider(
+        transport,
+        'live',
+        'jev-1.13.0',
+        2000,
+        2,
+      ).evaluate(fixture),
+    ).rejects.toMatchObject({
+      kind: 'rate_limit',
+      metadata: {
+        retryCount: 1,
+        attempts: [
+          { sequence: 1, providerRequestId: 'rate-1', outcome: 'rate_limit' },
+          { sequence: 2, providerRequestId: 'rate-2', outcome: 'rate_limit' },
+        ],
+      },
+    });
+  });
+
+  it.each([
+    ['connection', () => Promise.reject(new TypeError('connection refused'))],
+    [
+      'timeout',
+      () => Promise.reject(new DOMException('timed out', 'TimeoutError')),
+    ],
+    [
+      'server',
+      () => Promise.resolve({ status: 503, body: {}, requestId: 'server-1' }),
+    ],
+  ] as const)(
+    'normalizes %s failures without returning judgments',
+    async (outcome, send) => {
+      const transport: JevTransport = {
+        async send() {
+          return send();
+        },
+      };
+      await expect(
+        new JevOperationalJudgmentProvider(
+          transport,
+          'live',
+          'jev-1.13.0',
+          2000,
+          1,
+        ).evaluate(fixture),
+      ).rejects.toMatchObject({
+        kind: outcome,
+        metadata: { attempts: [{ sequence: 1, outcome }] },
+      });
+    },
+  );
 });

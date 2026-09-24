@@ -2,6 +2,8 @@ import { Button } from '#components/ui/button';
 import { Badge } from '#components/ui/badge';
 import { DecisionTrace } from '#components/decision-trace';
 import { ReviewActions } from '#components/review-actions';
+import { ReevaluationActions } from '#components/reevaluation-actions';
+import { EvaluationStatusRefresh } from '#components/evaluation-status-refresh';
 import { Separator } from '#components/ui/separator';
 import { TriageCaseDetailSchema } from '@incident-command-center/contracts';
 import { ArrowLeft, ExternalLink } from 'lucide-react';
@@ -29,6 +31,12 @@ export default async function TriageCasePage({
 
   return (
     <main className="mx-auto min-h-screen w-full max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
+      <EvaluationStatusRefresh
+        active={
+          detail.evaluationProgress?.status === 'pending' ||
+          detail.evaluationProgress?.status === 'retrying'
+        }
+      />
       <Button asChild variant="ghost" size="sm">
         <Link href="/triage">
           <ArrowLeft data-icon="inline-start" />
@@ -59,6 +67,16 @@ export default async function TriageCasePage({
                   : 'Deterministic Evaluation'}
             </Badge>
           )}
+          <Badge
+            className="mt-3 ml-2"
+            variant={
+              detail.evaluationProgress?.status === 'failed'
+                ? 'destructive'
+                : 'secondary'
+            }
+          >
+            Evaluation {detail.evaluationProgress?.status ?? 'pending'}
+          </Badge>
         </div>
         {detail.incidentId && (
           <Button asChild variant="outline">
@@ -72,13 +90,29 @@ export default async function TriageCasePage({
       <DecisionTrace
         signal={detail.signal}
         evaluation={detail.evaluation}
+        evaluationHistory={detail.evaluationHistory}
+        evaluationProgress={detail.evaluationProgress}
+        evaluationProgressHistory={detail.evaluationProgressHistory}
         reviewTask={detail.reviewTask}
         corroboratingFacts={detail.corroboratingFacts}
         policyDecision={detail.policyDecision}
+        policyDecisionHistory={detail.policyDecisionHistory}
         workflowActions={detail.workflowActions}
         timelineEvents={detail.timelineEvents}
         humanOverrides={detail.humanOverrides}
       />
+      {detail.evaluation &&
+        !['pending', 'retrying'].includes(
+          detail.evaluationProgress?.status ?? '',
+        ) &&
+        process.env.PUBLIC_DEMO_READ_ONLY !== 'true' && (
+          <ReevaluationActions
+            apiBaseUrl={process.env.PUBLIC_API_BASE_URL!}
+            triageCaseId={detail.triageCase.id}
+            questionSetVersion={detail.evaluation.questionSetVersion}
+            policyVersion={detail.evaluation.policyVersion}
+          />
+        )}
       {detail.reviewTask &&
         !detail.reviewTask.resolvedAt &&
         process.env.PUBLIC_DEMO_READ_ONLY !== 'true' && (

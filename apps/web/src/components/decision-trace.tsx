@@ -11,6 +11,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '#components/ui/tabs';
 import type {
   CorroboratingFact,
   Evaluation,
+  EvaluationProgress,
   ReviewTask,
   PolicyDecision,
   Signal,
@@ -22,9 +23,13 @@ import type {
 interface DecisionTraceProperties {
   signal: Signal;
   evaluation: Evaluation | null;
+  evaluationHistory?: Evaluation[];
+  evaluationProgress?: EvaluationProgress | null;
+  evaluationProgressHistory?: EvaluationProgress[];
   reviewTask?: ReviewTask | null;
   corroboratingFacts: CorroboratingFact[];
   policyDecision: PolicyDecision | null;
+  policyDecisionHistory?: PolicyDecision[];
   workflowActions: WorkflowAction[];
   timelineEvents: TimelineEvent[];
   humanOverrides?: HumanOverride[];
@@ -62,9 +67,13 @@ function executionCount(action: WorkflowAction): number {
 export function DecisionTrace({
   signal,
   evaluation,
+  evaluationHistory = [],
+  evaluationProgress,
+  evaluationProgressHistory = [],
   reviewTask,
   corroboratingFacts,
   policyDecision,
+  policyDecisionHistory = [],
   workflowActions,
   timelineEvents,
   humanOverrides = [],
@@ -124,6 +133,17 @@ export function DecisionTrace({
       </TabsContent>
 
       <TabsContent value="judgments" className="mt-4 space-y-4">
+        {evaluationProgress &&
+          ['pending', 'retrying'].includes(evaluationProgress.status) && (
+            <Alert>
+              <AlertTitle>Evaluation {evaluationProgress.status}</AlertTitle>
+              <AlertDescription>
+                {evaluationProgress.status === 'retrying'
+                  ? `${evaluationProgress.attempts.length} provider attempt(s) recorded. Jev is being retried within its deadline.`
+                  : 'The Evaluation is queued for the worker.'}
+              </AlertDescription>
+            </Alert>
+          )}
         {evaluation ? (
           <>
             <Alert>
@@ -255,6 +275,102 @@ export function DecisionTrace({
             </Card>
             <Card>
               <CardHeader>
+                <CardTitle>Provider attempts</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                {evaluation.attempts.map((attempt) => (
+                  <Card key={attempt.id} size="sm">
+                    <CardContent className="text-sm">
+                      Attempt {attempt.sequence} · {label(attempt.outcome)} ·{' '}
+                      {attempt.latencyMs.toFixed(0)} ms
+                      <span className="block text-muted-foreground">
+                        {attempt.providerRequestId ?? 'No provider request ID'}
+                      </span>
+                    </CardContent>
+                  </Card>
+                ))}
+              </CardContent>
+            </Card>
+            {evaluationHistory.length > 1 && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Evaluation history</CardTitle>
+                  <CardDescription>
+                    Earlier results remain unchanged.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  {evaluationHistory.map((item) => (
+                    <Card key={item.id} size="sm">
+                      <CardContent className="text-sm">
+                        <span className="font-medium">
+                          {label(item.status)}
+                        </span>{' '}
+                        · {item.evaluatedAt}
+                        <span className="block text-muted-foreground">
+                          {item.id}
+                        </span>
+                        {item.previousEvaluationId && (
+                          <span className="block text-muted-foreground">
+                            Follows {item.previousEvaluationId}
+                          </span>
+                        )}
+                      </CardContent>
+                    </Card>
+                  ))}
+                </CardContent>
+              </Card>
+            )}
+            {evaluationProgressHistory.length > 1 && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Re-evaluation requests</CardTitle>
+                  <CardDescription>
+                    Operator evidence and version selections sent with each
+                    request.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  {evaluationProgressHistory
+                    .filter((request) => request.previousEvaluationId)
+                    .map((request) => (
+                      <Card key={request.id} size="sm">
+                        <CardContent className="text-sm">
+                          <p className="font-medium">
+                            {request.requestedBy} · {request.reason}
+                          </p>
+                          <p className="text-muted-foreground">
+                            {request.requestedAt} · {label(request.status)}
+                          </p>
+                          {request.additionalEvidence && (
+                            <p className="mt-2 whitespace-pre-wrap">
+                              {request.additionalEvidence}
+                            </p>
+                          )}
+                          {request.requestedModel && (
+                            <p className="mt-2 text-muted-foreground">
+                              Requested model: {request.requestedModel}
+                            </p>
+                          )}
+                          {request.requestedQuestionSetVersion && (
+                            <p className="text-muted-foreground">
+                              Question set:{' '}
+                              {request.requestedQuestionSetVersion}
+                            </p>
+                          )}
+                          {request.requestedPolicyVersion && (
+                            <p className="text-muted-foreground">
+                              Policy: {request.requestedPolicyVersion}
+                            </p>
+                          )}
+                        </CardContent>
+                      </Card>
+                    ))}
+                </CardContent>
+              </Card>
+            )}
+            <Card>
+              <CardHeader>
                 <CardTitle>Corroborating Facts</CardTitle>
                 <CardDescription>
                   Machine-verifiable conditions used by policy
@@ -286,6 +402,34 @@ export function DecisionTrace({
       </TabsContent>
 
       <TabsContent value="policy" className="mt-4">
+        {policyDecisionHistory.length > 1 && (
+          <Card className="mb-4">
+            <CardHeader>
+              <CardTitle>Policy Decision history</CardTitle>
+              <CardDescription>
+                Later decisions can authorize new work; earlier effects remain
+                recorded.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {policyDecisionHistory.map((decision) => (
+                <Card key={decision.id} size="sm">
+                  <CardContent className="text-sm">
+                    {decision.version} · {decision.decidedAt}
+                    <span className="block text-muted-foreground">
+                      {decision.id} · Evaluation {decision.evaluationId}
+                    </span>
+                    {decision.supersedesPolicyDecisionId && (
+                      <span className="block text-muted-foreground">
+                        Follows {decision.supersedesPolicyDecisionId}
+                      </span>
+                    )}
+                  </CardContent>
+                </Card>
+              ))}
+            </CardContent>
+          </Card>
+        )}
         <Card>
           <CardHeader>
             <CardTitle>Policy Decision</CardTitle>
