@@ -15,6 +15,8 @@ import {
   IncidentDetailSchema,
   MonitoringAlertInputSchema,
   MonitoringAlertIngestionResultSchema,
+  LogAnomalyIngestionResultSchema,
+  LogAnomalyInputSchema,
   TriageQueueSchema,
   TriageCaseDetailSchema,
   ReviewQueueSchema,
@@ -120,6 +122,23 @@ export async function buildApi({
   });
 
   if (triageSystem) {
+    app.post('/api/v1/signals/log-anomalies', async (request, reply) => {
+      const input = LogAnomalyInputSchema.safeParse(request.body);
+      if (!input.success) {
+        return reply.code(400).send({
+          error: 'Invalid Log Anomaly',
+          issues: input.error.issues,
+        });
+      }
+      const correlationId = z.uuid().parse(request.id);
+      const result = LogAnomalyIngestionResultSchema.parse(
+        await triageSystem.ingestLogAnomaly(input.data, correlationId),
+      );
+      return reply
+        .header('location', `/api/v1/triage-cases/${result.triageCase.id}`)
+        .code(result.deduplicated ? 200 : 202)
+        .send(result);
+    });
     app.post('/api/v1/signals/customer-reports', async (request, reply) => {
       const input = CustomerReportInputSchema.safeParse(request.body);
       if (!input.success) {

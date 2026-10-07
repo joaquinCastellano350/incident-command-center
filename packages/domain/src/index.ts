@@ -2,6 +2,7 @@ import type {
   MonitoringAlertInput,
   DeploymentEventInput,
   CustomerReportInput,
+  LogAnomalyInput,
   OperationalJudgments,
   PolicyRuleResult,
   WorkflowActionType,
@@ -212,6 +213,46 @@ export function evaluateCustomerReportDeterministically(
       owner === 'unknown' ? 0.7 : 0.8,
     ),
     evidenceSufficiency: { yesProbability: 0.75 },
+  };
+}
+
+export function evaluateLogAnomalyDeterministically(
+  signal: LogAnomalyInput,
+): OperationalJudgments {
+  const repeated = signal.occurrenceCount >= 10;
+  const enoughSamples = signal.sampleMessages.length >= 2;
+  const owner = Object.hasOwn(NORTHSTAR_SERVICE_DOMAINS, signal.service)
+    ? NORTHSTAR_SERVICE_DOMAINS[
+        signal.service as keyof typeof NORTHSTAR_SERVICE_DOMAINS
+      ]
+    : 'unknown';
+  return {
+    priorityAssessment: distribution(
+      repeated ? 'P2' : 'P3',
+      ['P0', 'P1', 'P2', 'P3'],
+      0.98,
+    ),
+    customerReach: distribution(
+      repeated ? 'subset' : 'unknown',
+      ['single', 'subset', 'widespread', 'unknown'],
+      0.97,
+    ),
+    regionalReach: distribution(
+      'single_region',
+      ['single_region', 'multi_region', 'global', 'not_applicable', 'unknown'],
+      0.99,
+    ),
+    serviceBreadth: distribution(
+      'single_service',
+      ['single_service', 'multi_service', 'platform_wide', 'unknown'],
+      0.98,
+    ),
+    primaryOwningDomain: distribution(
+      owner,
+      ['payments', 'authentication', 'fulfillment', 'platform', 'unknown'],
+      owner === 'unknown' ? 0.98 : 0.99,
+    ),
+    evidenceSufficiency: { yesProbability: enoughSamples ? 0.98 : 0.4 },
   };
 }
 
@@ -427,6 +468,10 @@ export function decideExistingIncidentAutomation(
     !priorEffects.pageAttempted &&
     (ownerAlreadyAssigned || assignOwner) &&
     (incident.currentPriority === 'P0' || incident.currentPriority === 'P1') &&
+    (judgments.priorityAssessment.choice === 'P0' ||
+      judgments.priorityAssessment.choice === 'P1') &&
+    selectedProbability(judgments.priorityAssessment) >=
+      thresholds.priorityChoiceProbability &&
     judgments.evidenceSufficiency.yesProbability >=
       thresholds.evidenceSufficiencyYesProbability &&
     hasCorroboratingFact;
@@ -454,10 +499,10 @@ export function decideExistingIncidentAutomation(
       action: 'page_on_call',
       outcome: pageOnCall ? 'authorized' : 'denied',
       explanation: pageOnCall
-        ? `Current Priority is P0/P1, ownership meets its threshold, Evidence Sufficiency is at least ${thresholds.evidenceSufficiencyYesProbability}, and a Corroborating Fact exists.`
+        ? `Current Priority and the latest Priority Assessment are P0/P1, priority and ownership meet their thresholds, Evidence Sufficiency is at least ${thresholds.evidenceSufficiencyYesProbability}, and a Corroborating Fact exists.`
         : priorEffects.pageAttempted
           ? 'A prior page was already attempted; no duplicate automatic page is authorized.'
-          : `Paging requires P0/P1 Current Priority, non-conflicting ownership at 0.95 probability, Evidence Sufficiency at ${thresholds.evidenceSufficiencyYesProbability}, and a Corroborating Fact.`,
+          : `Paging requires P0/P1 Current Priority and Priority Assessment at its confidence threshold, non-conflicting ownership at 0.95 probability, Evidence Sufficiency at ${thresholds.evidenceSufficiencyYesProbability}, and a Corroborating Fact.`,
     },
     {
       ruleId: 'existing-signal-not-relinked',

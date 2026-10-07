@@ -25,6 +25,14 @@ After the payment Incident opens, three Customer Reports describe the same check
 
 A single Customer Report says that sign-in "has been acting strange" but provides no customer reference, region, timing, error, or reproducible behavior. Jev may still return a best-fit Priority Assessment and Primary Owning Domain, but Evidence Sufficiency is too low for action. Policy creates a standard Review Task, and an Operator dismisses the Triage Case with a recorded reason because the available evidence does not justify creating or joining an Incident.
 
+## Log Anomaly and non-paging paths
+
+A Log Anomaly for `checkout-api` in `us-east` reports 28 `PaymentAuthorizationTimeout` occurrences between 12:00 and 12:05 UTC, with two sample messages. A high-evidence P2 Evaluation permits Incident creation and payments assignment, with no automatic page. The Signal retains its error signature, count, messages, and window, and both the Triage Case and Incident show the resulting Operational Judgments.
+
+A single transient occurrence with only one sample message has low Evidence Sufficiency and a P3 Priority Assessment. Policy creates a standard Review Task, no Incident, and no page. An Operator can dismiss the Triage Case with a retained reason. A well-documented P3 Signal also stays in review because minor impact does not authorize automatic Incident creation or paging.
+
+For a repeated Log Anomaly from a Service outside the known Northstar Market mapping, Primary Owning Domain remains `unknown`. Policy may create a P2 Incident when the other gates pass, but assignment is withheld and an Operator receives a Review Task; `platform` is never used as a fallback.
+
 ## Correlation policy
 
 - A Deployment Event corroborates a regression for the same service and region within 15 minutes.

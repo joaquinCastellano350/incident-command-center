@@ -68,15 +68,16 @@ export default async function IncidentPage({
           Linked Signals
         </h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Customer evidence and the Incident Match Evaluation supporting each
-          link.
+          Supporting Signals and the Incident Match Evaluation for each link.
         </p>
         <Table className="mt-4">
           <TableHeader>
             <TableRow>
               <TableHead>Signal</TableHead>
+              <TableHead>Source details</TableHead>
               <TableHead>Reported</TableHead>
               <TableHead>Incident Match</TableHead>
+              <TableHead>Operational Judgments</TableHead>
               <TableHead>Evaluation</TableHead>
             </TableRow>
           </TableHeader>
@@ -99,6 +100,33 @@ export default async function IncidentPage({
                       {signal.sourceReference}
                     </span>
                   </TableCell>
+                  <TableCell className="max-w-xs whitespace-normal break-words text-sm">
+                    <span className="block">
+                      {signal.sourceType.replaceAll('_', ' ')}
+                    </span>
+                    {signal.sourceType === 'log_anomaly' && (
+                      <span className="block text-muted-foreground">
+                        <span className="block">Service: {signal.service}</span>
+                        <span className="block">
+                          Provider: {signal.provider}
+                        </span>
+                        <span className="block">
+                          Signature: {signal.facts.errorSignature}
+                        </span>
+                        <span className="block">
+                          Count: {signal.facts.occurrenceCount} in{' '}
+                          {signal.region}
+                        </span>
+                        <span className="block">
+                          Window: {signal.facts.windowStartedAt} to{' '}
+                          {signal.facts.windowEndedAt}
+                        </span>
+                        <span className="block">
+                          Samples: {signal.facts.sampleMessages.join(' · ')}
+                        </span>
+                      </span>
+                    )}
+                  </TableCell>
                   <TableCell>
                     {new Date(signal.occurredAt).toLocaleString('en-US', {
                       timeZone: 'UTC',
@@ -115,6 +143,42 @@ export default async function IncidentPage({
                       </span>
                     )}
                   </TableCell>
+                  <TableCell className="text-sm">
+                    {evaluation.judgments ? (
+                      <ul className="space-y-1">
+                        <li>
+                          Priority:{' '}
+                          {evaluation.judgments.priorityAssessment.choice}
+                        </li>
+                        <li>
+                          Customer Reach:{' '}
+                          {evaluation.judgments.customerReach.choice}
+                        </li>
+                        <li>
+                          Regional Reach:{' '}
+                          {evaluation.judgments.regionalReach.choice}
+                        </li>
+                        <li>
+                          Service Breadth:{' '}
+                          {evaluation.judgments.serviceBreadth.choice}
+                        </li>
+                        <li>
+                          Primary Owning Domain:{' '}
+                          {evaluation.judgments.primaryOwningDomain.choice}
+                        </li>
+                        <li>
+                          Evidence Sufficiency:{' '}
+                          {Math.round(
+                            evaluation.judgments.evidenceSufficiency
+                              .yesProbability * 100,
+                          )}
+                          %
+                        </li>
+                      </ul>
+                    ) : (
+                      'Unavailable'
+                    )}
+                  </TableCell>
                   <TableCell>
                     <Button asChild variant="link" size="sm" className="px-0">
                       <Link href={`/triage/${evaluation.triageCaseId}`}>
@@ -127,7 +191,7 @@ export default async function IncidentPage({
             })}
             {detail.evidenceLinks.length === 0 && (
               <TableRow>
-                <TableCell colSpan={4} className="text-muted-foreground">
+                <TableCell colSpan={6} className="text-muted-foreground">
                   No linked Signals yet.
                 </TableCell>
               </TableRow>

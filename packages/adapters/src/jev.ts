@@ -273,7 +273,11 @@ export interface JevRecording {
   body: unknown;
   requestId: string;
   expectedSignal: {
-    sourceType: 'monitoring_alert' | 'deployment_event';
+    sourceType:
+      | 'monitoring_alert'
+      | 'deployment_event'
+      | 'customer_report'
+      | 'log_anomaly';
     service: string;
     region: string | null;
     facts: Record<string, unknown>;

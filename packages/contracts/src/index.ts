@@ -96,6 +96,36 @@ export const CustomerReportInputSchema = z
   .strict();
 export type CustomerReportInput = z.infer<typeof CustomerReportInputSchema>;
 
+export const LogAnomalyInputSchema = z
+  .object({
+    provider: z.string().trim().min(1),
+    sourceEventKey: z.string().trim().min(1),
+    sourceReference: z.string().trim().min(1),
+    service: z.string().trim().min(1),
+    region: z.enum(['us-east', 'eu-west', 'sa-east']),
+    errorSignature: z.string().trim().min(1),
+    occurrenceCount: z.number().int().positive(),
+    sampleMessages: z.array(z.string().trim().min(1)).min(1).max(10),
+    windowStartedAt: z.iso.datetime(),
+    windowEndedAt: z.iso.datetime(),
+    environment: z.string().trim().min(1).optional(),
+    rawFixtureReference: z.string().trim().min(1).optional(),
+  })
+  .strict()
+  .refine((input) => input.windowStartedAt < input.windowEndedAt, {
+    message: 'Log Anomaly window must end after it starts',
+    path: ['windowEndedAt'],
+  });
+export type LogAnomalyInput = z.infer<typeof LogAnomalyInputSchema>;
+
+export const LogAnomalyFactsSchema = z.object({
+  errorSignature: z.string().min(1),
+  occurrenceCount: z.number().int().positive(),
+  sampleMessages: z.array(z.string().min(1)).min(1),
+  windowStartedAt: z.iso.datetime(),
+  windowEndedAt: z.iso.datetime(),
+});
+
 export const CustomerReportFactsSchema = z.object({
   subject: z.string().min(1),
   message: z.string().min(1),
@@ -150,10 +180,16 @@ export const CustomerReportSignalSchema = SignalEnvelopeSchema.extend({
   facts: CustomerReportFactsSchema,
 });
 
+export const LogAnomalySignalSchema = SignalEnvelopeSchema.extend({
+  sourceType: z.literal('log_anomaly'),
+  facts: LogAnomalyFactsSchema,
+});
+
 export const SignalSchema = z.discriminatedUnion('sourceType', [
   MonitoringAlertSignalSchema,
   DeploymentEventSignalSchema,
   CustomerReportSignalSchema,
+  LogAnomalySignalSchema,
 ]);
 
 export type Signal = z.infer<typeof SignalSchema>;
@@ -207,6 +243,15 @@ export const CustomerReportIngestionResultSchema = z.object({
 });
 export type CustomerReportIngestionResult = z.infer<
   typeof CustomerReportIngestionResultSchema
+>;
+
+export const LogAnomalyIngestionResultSchema = z.object({
+  signal: LogAnomalySignalSchema,
+  triageCase: TriageCaseSchema,
+  deduplicated: z.boolean(),
+});
+export type LogAnomalyIngestionResult = z.infer<
+  typeof LogAnomalyIngestionResultSchema
 >;
 
 const probability = z.number().min(0).max(1);

@@ -24,6 +24,7 @@ import {
   IncidentDetailSchema,
   IncidentSchema,
   MonitoringAlertIngestionResultSchema,
+  LogAnomalyIngestionResultSchema,
   PageRequestSchema,
   PolicyDecisionSchema,
   SignalSchema,
@@ -52,6 +53,8 @@ import {
   type IncidentDetail,
   type MonitoringAlertIngestionResult,
   type MonitoringAlertInput,
+  type LogAnomalyIngestionResult,
+  type LogAnomalyInput,
   type OperationalJudgments,
   type PageRequest,
   type PolicyDecision,
@@ -77,6 +80,7 @@ import {
   evaluateDeploymentEventDeterministically,
   evaluateCustomerReportDeterministically,
   evaluateMonitoringAlertDeterministically,
+  evaluateLogAnomalyDeterministically,
   NORTHSTAR_SERVICE_DOMAINS,
   reviewUrgency,
   WorkflowProviderError,
@@ -142,7 +146,8 @@ interface HealthJobRow {
 
 interface SignalRow {
   id: string;
-  source_type: 'monitoring_alert' | 'deployment_event' | 'customer_report';
+  source_type:
+    'monitoring_alert' | 'deployment_event' | 'customer_report' | 'log_anomaly';
   provider: string;
   source_event_key: string;
   source_reference: string;
@@ -209,7 +214,7 @@ const schemaSql = `
 
   CREATE TABLE IF NOT EXISTS signals (
     id uuid PRIMARY KEY,
-    source_type text NOT NULL CHECK (source_type IN ('monitoring_alert', 'deployment_event', 'customer_report')),
+    source_type text NOT NULL CHECK (source_type IN ('monitoring_alert', 'deployment_event', 'customer_report', 'log_anomaly')),
     provider text NOT NULL,
     source_event_key text NOT NULL,
     source_reference text NOT NULL,
@@ -241,7 +246,7 @@ const schemaSql = `
   ALTER TABLE signals ALTER COLUMN title DROP NOT NULL;
   ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_source_type_check;
   ALTER TABLE signals ADD CONSTRAINT signals_source_type_check
-    CHECK (source_type IN ('monitoring_alert', 'deployment_event', 'customer_report'));
+    CHECK (source_type IN ('monitoring_alert', 'deployment_event', 'customer_report', 'log_anomaly'));
   ALTER TABLE triage_cases DROP CONSTRAINT IF EXISTS triage_cases_status_check;
   ALTER TABLE triage_cases ADD CONSTRAINT triage_cases_status_check
     CHECK (status IN ('queued', 'ready_for_evaluation', 'incident_created', 'needs_review', 'evidence_linked', 'dismissed'));
@@ -897,6 +902,37 @@ export class PostgresTriageSystem implements TriageSystem {
             customerReference: input.customerReference ?? null,
             affectedOperation: input.affectedOperation ?? null,
             reportedAt: input.reportedAt ?? null,
+          },
+          rawFixtureReference: input.rawFixtureReference ?? null,
+        },
+        correlationId,
+      ),
+    );
+  }
+
+  async ingestLogAnomaly(
+    input: LogAnomalyInput,
+    correlationId: string,
+  ): Promise<LogAnomalyIngestionResult> {
+    return LogAnomalyIngestionResultSchema.parse(
+      await this.ingestSignal(
+        {
+          sourceType: 'log_anomaly',
+          provider: input.provider,
+          sourceEventKey: input.sourceEventKey,
+          sourceReference: input.sourceReference,
+          occurredAt: input.windowEndedAt,
+          service: input.service,
+          environment: input.environment ?? null,
+          region: input.region,
+          title: input.errorSignature,
+          content: null,
+          facts: {
+            errorSignature: input.errorSignature,
+            occurrenceCount: input.occurrenceCount,
+            sampleMessages: input.sampleMessages,
+            windowStartedAt: input.windowStartedAt,
+            windowEndedAt: input.windowEndedAt,
           },
           rawFixtureReference: input.rawFixtureReference ?? null,
         },
@@ -1716,15 +1752,24 @@ export class DeterministicOperationalJudgmentProvider implements OperationalJudg
                 ...(signal.title ? { title: signal.title } : {}),
                 ...(signal.content ? { content: signal.content } : {}),
               })
-            : evaluateDeploymentEventDeterministically({
-                provider: signal.provider,
-                sourceEventKey: signal.sourceEventKey,
-                sourceReference: signal.sourceReference,
-                service: signal.service,
-                region: signal.region as DeploymentEventInput['region'],
-                occurredAt: signal.occurredAt,
-                ...signal.facts,
-              }),
+            : signal.sourceType === 'log_anomaly'
+              ? evaluateLogAnomalyDeterministically({
+                  provider: signal.provider,
+                  sourceEventKey: signal.sourceEventKey,
+                  sourceReference: signal.sourceReference,
+                  service: signal.service,
+                  region: signal.region as LogAnomalyInput['region'],
+                  ...signal.facts,
+                })
+              : evaluateDeploymentEventDeterministically({
+                  provider: signal.provider,
+                  sourceEventKey: signal.sourceEventKey,
+                  sourceReference: signal.sourceReference,
+                  service: signal.service,
+                  region: signal.region as DeploymentEventInput['region'],
+                  occurredAt: signal.occurredAt,
+                  ...signal.facts,
+                }),
       incidentMatches: input.candidates.map((candidate) => ({
         candidateIncidentId: candidate.id,
         judgment: {

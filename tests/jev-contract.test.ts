@@ -59,6 +59,50 @@ const fixture = EvaluationInputSchema.parse({
 });
 
 describe('TypeSafe Jev contract', () => {
+  it('sends structured Log Anomaly facts to the typed Evaluation questions', () => {
+    const logAnomaly = EvaluationInputSchema.parse({
+      signal: {
+        id: randomUUID(),
+        sourceType: 'log_anomaly',
+        provider: 'northstar-logs',
+        sourceEventKey: 'log-1',
+        sourceReference: 'logs-checkout-1',
+        occurredAt: '2026-09-21T12:05:00.000Z',
+        receivedAt: '2026-09-21T12:05:05.000Z',
+        service: 'checkout-api',
+        region: 'us-east',
+        environment: 'production',
+        title: 'PaymentAuthorizationTimeout',
+        content: null,
+        normalizationVersion: 1,
+        rawFixtureReference: null,
+        correlationId: randomUUID(),
+        facts: {
+          errorSignature: 'PaymentAuthorizationTimeout',
+          occurrenceCount: 28,
+          sampleMessages: ['Authorization timed out', 'Payment request failed'],
+          windowStartedAt: '2026-09-21T12:00:00.000Z',
+          windowEndedAt: '2026-09-21T12:05:00.000Z',
+        },
+      },
+      corroboratingFacts: [],
+      candidates: [],
+    });
+    const request = buildJevRequest(logAnomaly);
+    expect(request.state.signal).toMatchObject({
+      sourceType: 'log_anomaly',
+      facts: logAnomaly.signal.facts,
+    });
+    expect(Object.keys(request.questions)).toEqual([
+      'priorityAssessment',
+      'customerReach',
+      'regionalReach',
+      'serviceBreadth',
+      'primaryOwningDomain',
+      'evidenceSufficiency',
+    ]);
+  });
+
   it('can evaluate a recently resolved Incident candidate', () => {
     const incident = IncidentSchema.parse({
       id: fixture.candidates[0]!.id,

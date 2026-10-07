@@ -45,7 +45,11 @@ function label(value: string): string {
 function facts(signal: Signal): Array<[string, string]> {
   return Object.entries(signal.facts).map(([key, value]) => [
     label(key),
-    value === null ? 'Unknown' : String(value),
+    value === null
+      ? 'Unknown'
+      : Array.isArray(value)
+        ? value.join(' · ')
+        : String(value),
   ]);
 }
 

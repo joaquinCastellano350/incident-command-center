@@ -9,6 +9,8 @@ import type {
   CustomerReportInput,
   MonitoringAlertIngestionResult,
   MonitoringAlertInput,
+  LogAnomalyIngestionResult,
+  LogAnomalyInput,
   TriageCase,
   TriageCaseDetail,
   TriageJobMessageV1,
@@ -45,6 +47,10 @@ export interface HealthJobQueue {
 }
 
 export interface TriageSystem {
+  ingestLogAnomaly(
+    input: LogAnomalyInput,
+    correlationId: string,
+  ): Promise<LogAnomalyIngestionResult>;
   ingestCustomerReport(
     input: CustomerReportInput,
     correlationId: string,
