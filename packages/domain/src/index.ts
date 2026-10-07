@@ -6,6 +6,7 @@ import type {
   PolicyRuleResult,
   WorkflowActionType,
   EvaluationAttempt,
+  ProviderRequest,
   Incident,
 } from '@incident-command-center/contracts';
 
@@ -57,6 +58,7 @@ export interface OperationalJudgmentResult<TJudgments> {
   configuredModel: string;
   resolvedModel: string;
   providerRequestId: string | null;
+  providerRequest?: ProviderRequest | null;
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;

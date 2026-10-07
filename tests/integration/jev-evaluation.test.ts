@@ -150,6 +150,25 @@ describeWithPostgres(
         const result = await detail(accepted.triageCase.id);
         expect(result.evaluation).toMatchObject({
           mode: 'recorded',
+          request: {
+            input: {
+              signal: { id: accepted.signal.id },
+              questionSetVersion: 'northstar-triage.v1',
+              corroboratingFacts: [{ kind: 'threshold_breach' }],
+              candidates: [],
+            },
+            provider: {
+              model: 'jev-1.13.0',
+              state: { signal: { id: accepted.signal.id } },
+              questions: {
+                priorityAssessment: {
+                  instructions: expect.stringContaining(
+                    'Assess response priority',
+                  ),
+                },
+              },
+            },
+          },
           configuredModel: 'jev-1.13.0',
           resolvedModel: 'jev-1.13.0',
           providerRequestId: 'recorded:canonical-p1-v1',
@@ -219,6 +238,22 @@ describeWithPostgres(
         expect(result.evaluation).toMatchObject({
           mode: 'recorded',
           status: 'failed',
+          request: {
+            input: {
+              signal: { id: accepted.signal.id },
+              questionSetVersion: 'northstar-triage.v1',
+            },
+            provider: {
+              model: 'jev-1.13.0',
+              questions: {
+                priorityAssessment: {
+                  instructions: expect.stringContaining(
+                    'Assess response priority',
+                  ),
+                },
+              },
+            },
+          },
           providerRequestId: 'recorded:invalid',
           inputTokens: 12,
           outputTokens: 2,
@@ -230,6 +265,105 @@ describeWithPostgres(
         expect(result.reviewTask).toMatchObject({ urgency: 'urgent' });
         expect(result.policyDecision).toBeNull();
         expect(result.workflowActions).toEqual([]);
+      } finally {
+        await worker.stop();
+      }
+    });
+
+    it('reopens review when a later Evaluation still needs an Operator', async () => {
+      const accepted = await submitAlert({
+        ...expectedSignal,
+        service: `review-again-${randomUUID()}`,
+      });
+      const recording = JSON.parse(
+        await readFile('apps/worker/recordings/canonical-p1.json', 'utf8'),
+      );
+      let calls = 0;
+      const transport = {
+        async send(request: ReturnType<typeof buildJevRequest>) {
+          calls++;
+          if (calls === 1) {
+            return {
+              status: 200,
+              body: { model: request.model, answers: {}, usage: {} },
+              requestId: 'invalid-first-evaluation',
+            };
+          }
+          const body = structuredClone(recording[0].body);
+          body.answers.evidenceSufficiency.noul = 0.2;
+          return { status: 200, body, requestId: 'low-evidence-reevaluation' };
+        },
+      };
+      const worker = createPostgresTriageWorker({
+        connectionString: isolatedUrl.toString(),
+        queueName,
+        clock,
+        judgmentProvider: new JevOperationalJudgmentProvider(transport, 'live'),
+      });
+      await worker.start();
+      try {
+        await expect
+          .poll(
+            async () =>
+              (await detail(accepted.triageCase.id)).evaluation?.status,
+            { timeout: 15_000 },
+          )
+          .toBe('failed');
+        const original = await detail(accepted.triageCase.id);
+        const dismissal = await api.inject({
+          method: 'POST',
+          url: `/api/v1/review-tasks/${accepted.triageCase.id}/resolve`,
+          headers: { 'x-operator-key': 'test-operator-key' },
+          payload: {
+            actor: 'demo-operator',
+            reason: 'Awaiting more evidence',
+            resolution: { type: 'dismiss' },
+          },
+        });
+        expect(dismissal.statusCode).toBe(200);
+        expect(dismissal.json().reviewTask.resolvedAt).not.toBeNull();
+        const request = await api.inject({
+          method: 'POST',
+          url: `/api/v1/triage-cases/${accepted.triageCase.id}/reevaluations`,
+          headers: { 'x-operator-key': 'test-operator-key' },
+          payload: {
+            actor: 'demo-operator',
+            reason: 'Assess new but insufficient evidence',
+            additionalEvidence: 'One customer supplied an incomplete report.',
+          },
+        });
+        expect(request.statusCode).toBe(202);
+        await expect
+          .poll(
+            async () =>
+              (await detail(accepted.triageCase.id)).evaluationHistory.length,
+            { timeout: 15_000 },
+          )
+          .toBe(2);
+        const current = await detail(accepted.triageCase.id);
+        expect(current.evaluationHistory[0]).toEqual(original.evaluation);
+        expect(current.evaluation).toMatchObject({
+          status: 'succeeded',
+          previousEvaluationId: original.evaluation?.id,
+        });
+        expect(current.triageCase.status).toBe('needs_review');
+        expect(current.reviewTask).toMatchObject({
+          resolvedAt: null,
+          reason: expect.stringContaining('Evidence Sufficiency'),
+        });
+        expect(current.policyDecision?.authorizedActions).toEqual([]);
+        expect(current.workflowActions).toEqual([]);
+        const queue = await api.inject({
+          method: 'GET',
+          url: '/api/v1/review-tasks',
+        });
+        expect(
+          queue
+            .json()
+            .items.map(
+              (item: { triageCase: { id: string } }) => item.triageCase.id,
+            ),
+        ).toContain(accepted.triageCase.id);
       } finally {
         await worker.stop();
       }
@@ -649,7 +783,8 @@ describeWithPostgres(
             .humanOverrides.map(
               (override: { replacementOutcome: { type: string } }) =>
                 override.replacementOutcome.type,
-            ),
+            )
+            .sort(),
         ).toEqual(['accept_incident', 'assign_owner']);
       } finally {
         await worker.stop();

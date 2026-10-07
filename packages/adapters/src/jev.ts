@@ -8,6 +8,7 @@ import {
   type EvaluationInput,
   type OperationalJudgments,
   type EvaluationAttempt,
+  type ProviderRequest,
 } from '@incident-command-center/contracts';
 import {
   NORTHSTAR_SERVICE_DOMAINS,
@@ -345,6 +346,7 @@ export class JevEvaluationFailure extends Error {
       configuredModel: string;
       resolvedModel: string;
       providerRequestId: string | null;
+      providerRequest: ProviderRequest | null;
       inputTokens: number;
       outputTokens: number;
       latencyMs: number;
@@ -442,6 +444,7 @@ export class JevOperationalJudgmentProvider implements OperationalJudgmentProvid
               configuredModel: request.model,
               resolvedModel,
               providerRequestId: requestId,
+              providerRequest: request,
               inputTokens,
               outputTokens,
               latencyMs: performance.now() - start,
@@ -495,6 +498,7 @@ export class JevOperationalJudgmentProvider implements OperationalJudgmentProvid
       configuredModel: request.model,
       resolvedModel,
       providerRequestId: requestId,
+      providerRequest: request,
       inputTokens,
       outputTokens,
       latencyMs: performance.now() - start,

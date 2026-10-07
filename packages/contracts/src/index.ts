@@ -299,6 +299,13 @@ export const EvaluationInputSchema = z.object({
 });
 export type EvaluationInput = z.infer<typeof EvaluationInputSchema>;
 
+export const ProviderRequestSchema = z.object({
+  model: z.string().min(1),
+  state: z.record(z.string(), z.unknown()),
+  questions: z.record(z.string(), z.unknown()),
+});
+export type ProviderRequest = z.infer<typeof ProviderRequestSchema>;
+
 export const OperationalJudgmentsSchema = z.object({
   priorityAssessment: choiceJudgmentSchema(['P0', 'P1', 'P2', 'P3']),
   customerReach: choiceJudgmentSchema([
@@ -369,6 +376,13 @@ export const EvaluationSchema = z
       'northstar-automation.v1',
       'northstar-automation.v2',
     ]),
+    request: z
+      .object({
+        input: EvaluationInputSchema,
+        provider: ProviderRequestSchema.nullable(),
+      })
+      .nullable()
+      .default(null),
     attemptId: z.uuid(),
     providerRequestId: z.string().nullable(),
     inputTokens: z.number().int().nonnegative(),

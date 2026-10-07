@@ -60,6 +60,7 @@ import {
   type TriageCaseDetail,
   type TriageJobMessageV1,
   type ReviewQueue,
+  type ReviewTask,
   type ReviewCommand,
   type PriorityOverrideCommand,
   type ReevaluationCommand,
@@ -1946,23 +1947,24 @@ export class PgBossTriageWorker {
         region: candidate.region,
       };
     });
+    const evaluationRequest = EvaluationInputSchema.parse({
+      signal,
+      additionalEvidence: progress.additional_evidence,
+      requestedModel: progress.requested_model,
+      questionSetVersion,
+      corroboratingFacts: corroboratingFacts.map(
+        ({ kind, summary, evidenceSignalIds }) => ({
+          kind,
+          summary,
+          evidenceSignalIds,
+        }),
+      ),
+      candidates,
+    });
     let judgmentResult: OperationalJudgmentResult<OperationalJudgments>;
     try {
       judgmentResult = await this.judgmentProvider.evaluate(
-        EvaluationInputSchema.parse({
-          signal,
-          additionalEvidence: progress.additional_evidence,
-          requestedModel: progress.requested_model,
-          questionSetVersion,
-          corroboratingFacts: corroboratingFacts.map(
-            ({ kind, summary, evidenceSignalIds }) => ({
-              kind,
-              summary,
-              evidenceSignalIds,
-            }),
-          ),
-          candidates,
-        }),
+        evaluationRequest,
         async (attempt) => {
           await this.pool.query(
             `UPDATE evaluation_progress SET attempts = attempts || $2::jsonb,
@@ -1986,6 +1988,7 @@ export class PgBossTriageWorker {
             configuredModel: progress.requested_model,
             resolvedModel: judgmentResult.resolvedModel,
             providerRequestId: judgmentResult.providerRequestId,
+            providerRequest: judgmentResult.providerRequest ?? null,
             inputTokens: judgmentResult.inputTokens,
             outputTokens: judgmentResult.outputTokens,
             latencyMs: judgmentResult.latencyMs,
@@ -2008,6 +2011,10 @@ export class PgBossTriageWorker {
         decisionSchemaVersion: 'operational-judgments.v1',
         questionSetVersion,
         policyVersion,
+        request: {
+          input: evaluationRequest,
+          provider: error.metadata.providerRequest,
+        },
         attemptId: error.metadata.attempts.at(-1)?.id ?? randomUUID(),
         attempts: error.metadata.attempts,
         evaluatedAt,
@@ -2034,12 +2041,7 @@ export class PgBossTriageWorker {
           JSON.stringify(evaluation.attempts),
         ],
       );
-      await transaction.executeSql(
-        `INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)
-         ON CONFLICT (triage_case_id) DO UPDATE SET
-           record = jsonb_set(EXCLUDED.record, '{id}', to_jsonb(review_tasks.id::text))`,
-        [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
-      );
+      await this.upsertReviewTask(transaction, reviewTask);
       await transaction.executeSql(
         "UPDATE triage_cases SET status = 'needs_review' WHERE id = $1 AND status NOT IN ('incident_created', 'evidence_linked')",
         [message.triageCaseId],
@@ -2062,6 +2064,10 @@ export class PgBossTriageWorker {
       decisionSchemaVersion: 'operational-judgments.v1',
       questionSetVersion,
       policyVersion,
+      request: {
+        input: evaluationRequest,
+        provider: judgmentResult.providerRequest ?? null,
+      },
       attemptId: judgmentResult.attempts?.at(-1)?.id ?? randomUUID(),
       attempts: judgmentResult.attempts ?? [],
       providerRequestId: judgmentResult.providerRequestId,
@@ -2207,12 +2213,7 @@ export class PgBossTriageWorker {
                 : 'The previous assignment failed permanently; Operator review is required.',
               createdAt: evaluatedAt,
             });
-            await transaction.executeSql(
-              `INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)
-               ON CONFLICT (triage_case_id) DO UPDATE SET record =
-                 jsonb_set(EXCLUDED.record, '{id}', to_jsonb(review_tasks.id::text))`,
-              [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
-            );
+            await this.upsertReviewTask(transaction, reviewTask);
           }
           if (
             automation.authorizedActions.includes('assign_owner') &&
@@ -2319,10 +2320,7 @@ export class PgBossTriageWorker {
             'Evidence linked to a resolved Incident; Operator review is required.',
           createdAt: evaluatedAt,
         });
-        await transaction.executeSql(
-          'INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb) ON CONFLICT (triage_case_id) DO NOTHING',
-          [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
-        );
+        await this.upsertReviewTask(transaction, reviewTask);
       }
       await transaction.executeSql(
         "UPDATE triage_cases SET status = 'evidence_linked' WHERE id = $1 AND signal_id = $2",
@@ -2351,10 +2349,7 @@ export class PgBossTriageWorker {
                 : 'Operational Judgments did not meet Incident creation policy.',
         createdAt: evaluatedAt,
       });
-      await transaction.executeSql(
-        'INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb) ON CONFLICT (triage_case_id) DO NOTHING',
-        [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
-      );
+      await this.upsertReviewTask(transaction, reviewTask);
       await transaction.executeSql(
         `UPDATE triage_cases SET status = 'needs_review'
          WHERE id = $1 AND signal_id = $2`,
@@ -2427,16 +2422,25 @@ export class PgBossTriageWorker {
           'Primary Owning Domain is unknown; assignment requires Operator review.',
         createdAt: evaluatedAt,
       });
-      await transaction.executeSql(
-        'INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb) ON CONFLICT (triage_case_id) DO NOTHING',
-        [reviewTask.id, message.triageCaseId, JSON.stringify(reviewTask)],
-      );
+      await this.upsertReviewTask(transaction, reviewTask);
     }
 
     await transaction.executeSql(
       `UPDATE triage_cases SET status = 'incident_created'
        WHERE id = $1 AND signal_id = $2`,
       [message.triageCaseId, message.signalId],
+    );
+  }
+
+  private async upsertReviewTask(
+    transaction: TransactionalDatabase,
+    reviewTask: ReviewTask,
+  ): Promise<void> {
+    await transaction.executeSql(
+      `INSERT INTO review_tasks (id, triage_case_id, record) VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (triage_case_id) DO UPDATE SET record =
+         jsonb_set(EXCLUDED.record, '{id}', to_jsonb(review_tasks.id::text))`,
+      [reviewTask.id, reviewTask.triageCaseId, JSON.stringify(reviewTask)],
     );
   }
 
