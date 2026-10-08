@@ -1,0 +1,15 @@
+{
+  "version": "incident-assistant-recorded.v1",
+  "expectedSignal": {
+    "sourceType": "monitoring_alert",
+    "metric": "payment_authorization_failure_rate",
+    "threshold": 2,
+    "observedValue": 18
+  },
+  "returnedModel": "gpt-5.6-terra-recorded-synthetic-v1",
+  "response": {
+    "claim": "Payment authorization failure rate was 18 against a threshold of 2.",
+    "hypothesis": "A recent checkout deployment may be related; verify against independent evidence.",
+    "draft": "We are investigating elevated payment authorization failures in checkout. We will share an update when more is confirmed."
+  }
+}

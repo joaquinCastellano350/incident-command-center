@@ -3,6 +3,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import cors from '@fastify/cors';
 import type {
   HealthSystem,
+  AssistantSystem,
   TriageSystem,
 } from '@incident-command-center/application';
 import {
@@ -24,10 +25,16 @@ import {
   ReviewCommandSchema,
   PriorityOverrideCommandSchema,
   ReevaluationCommandSchema,
+  AssistantCommandSchema,
+  AssistantInteractionSchema,
+  PublishUpdateCommandSchema,
+  PublishedUpdateSchema,
 } from '@incident-command-center/contracts';
 import {
   ReviewConflictError,
   ReviewTargetNotFoundError,
+  PublishConflictError,
+  AssistantQuotaError,
 } from '@incident-command-center/adapters';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
@@ -35,6 +42,7 @@ import { z } from 'zod';
 interface BuildApiDependencies {
   healthSystem: HealthSystem;
   triageSystem?: TriageSystem;
+  assistantSystem?: AssistantSystem;
   allowedOrigin: string;
   logger?: boolean;
   operatorKey?: string | undefined;
@@ -59,6 +67,7 @@ function triageQueueEvent(
 export async function buildApi({
   healthSystem,
   triageSystem,
+  assistantSystem,
   allowedOrigin,
   logger = true,
   operatorKey,
@@ -123,6 +132,71 @@ export async function buildApi({
   });
 
   if (triageSystem) {
+    if (assistantSystem) {
+      app.post(
+        '/api/v1/incidents/:id/assistant-interactions',
+        async (request, reply) => {
+          if (!hasOperatorAccess(request.headers['x-operator-key']))
+            return reply.code(403).send({ error: 'Operator access required' });
+          const parameters = JobParametersSchema.safeParse(request.params);
+          const command = AssistantCommandSchema.safeParse(request.body);
+          if (!parameters.success || !command.success)
+            return reply.code(400).send({ error: 'Invalid assistant request' });
+          let interaction;
+          try {
+            interaction = await assistantSystem.generate(
+              parameters.data.id,
+              command.data,
+            );
+          } catch (error) {
+            if (error instanceof AssistantQuotaError)
+              return reply.code(429).send({ error: error.message });
+            throw error;
+          }
+          if (!interaction)
+            return reply.code(404).send({ error: 'Incident not found' });
+          if (interaction.outcome !== 'accepted')
+            return reply
+              .code(interaction.outcome === 'provider_error' ? 502 : 422)
+              .send({
+                error: `Assistant ${interaction.outcome}`,
+                interactionId: interaction.id,
+              });
+          return reply
+            .code(201)
+            .send(AssistantInteractionSchema.parse(interaction));
+        },
+      );
+      app.post(
+        '/api/v1/incidents/:id/assistant-interactions/:interactionId/publish',
+        async (request, reply) => {
+          if (!hasOperatorAccess(request.headers['x-operator-key']))
+            return reply.code(403).send({ error: 'Operator access required' });
+          const parameters = z
+            .object({ id: z.uuid(), interactionId: z.uuid() })
+            .safeParse(request.params);
+          const command = PublishUpdateCommandSchema.safeParse(request.body);
+          if (!parameters.success || !command.success)
+            return reply
+              .code(400)
+              .send({ error: 'Invalid publication request' });
+          try {
+            const update = await assistantSystem.publish(
+              parameters.data.id,
+              parameters.data.interactionId,
+              command.data.actor,
+            );
+            if (!update)
+              return reply.code(404).send({ error: 'Status draft not found' });
+            return reply.code(201).send(PublishedUpdateSchema.parse(update));
+          } catch (error) {
+            if (error instanceof PublishConflictError)
+              return reply.code(409).send({ error: error.message });
+            throw error;
+          }
+        },
+      );
+    }
     app.post('/api/v1/signals/log-anomalies', async (request, reply) => {
       const input = LogAnomalyInputSchema.safeParse(request.body);
       if (!input.success) {

@@ -2,6 +2,7 @@ import { Button } from '#components/ui/button';
 import { DecisionTrace } from '#components/decision-trace';
 import { PriorityOverrideActions } from '#components/review-actions';
 import { IncidentLifecycleActions } from '#components/incident-lifecycle-actions';
+import { IncidentAssistant } from '#components/incident-assistant';
 import { Separator } from '#components/ui/separator';
 import { Badge } from '#components/ui/badge';
 import {
@@ -12,7 +13,11 @@ import {
   TableHeader,
   TableRow,
 } from '#components/ui/table';
-import { IncidentDetailSchema } from '@incident-command-center/contracts';
+import {
+  AssistantInteractionSchema,
+  IncidentDetailSchema,
+  PublishedUpdateSchema,
+} from '@incident-command-center/contracts';
 import { ArrowLeft } from 'lucide-react';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
@@ -217,6 +222,17 @@ export default async function IncidentPage({
         workflowActions={detail.workflowActions}
         timelineEvents={detail.timelineEvents}
         humanOverrides={detail.humanOverrides}
+      />
+      <IncidentAssistant
+        apiBaseUrl={process.env.PUBLIC_API_BASE_URL!}
+        incidentId={detail.incident.id}
+        interactions={detail.assistantInteractions.map((item) =>
+          AssistantInteractionSchema.parse(item),
+        )}
+        publishedUpdates={detail.publishedUpdates.map((item) =>
+          PublishedUpdateSchema.parse(item),
+        )}
+        readOnly={process.env.PUBLIC_DEMO_READ_ONLY === 'true'}
       />
     </main>
   );

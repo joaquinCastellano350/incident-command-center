@@ -19,7 +19,42 @@ import type {
   ReviewCommand,
   PriorityOverrideCommand,
   ReevaluationCommand,
+  AssistantCommand,
+  AssistantInteraction,
+  PublishedUpdate,
+  AssistantEvidence,
+  AssistantOutput,
 } from '@incident-command-center/contracts';
+
+export interface AssistantProviderRequest {
+  model: string;
+  configurationVersion: string;
+  command: AssistantCommand;
+  evidence: AssistantEvidence;
+}
+
+export interface AssistantProviderResult {
+  output: AssistantOutput;
+  returnedModel: string;
+  providerRequestId: string | null;
+  latencyMs: number;
+}
+
+export interface AssistantProvider {
+  generate(request: AssistantProviderRequest): Promise<AssistantProviderResult>;
+}
+
+export interface AssistantSystem {
+  generate(
+    incidentId: string,
+    command: AssistantCommand,
+  ): Promise<AssistantInteraction | null>;
+  publish(
+    incidentId: string,
+    interactionId: string,
+    actor: 'demo-operator',
+  ): Promise<PublishedUpdate | null>;
+}
 
 export interface HealthSystem {
   readiness(): Promise<HealthStatus>;

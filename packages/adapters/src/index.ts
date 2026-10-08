@@ -1,5 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+export {
+  createPostgresAssistantSystem,
+  PostgresAssistantSystem,
+  PublishConflictError,
+  AssistantQuotaError,
+} from './assistant.js';
+export {
+  LiveOpenAIAssistantProvider,
+  RecordedAssistantProvider,
+  LIVE_ASSISTANT_CONFIGURATION_VERSION,
+  RECORDED_ASSISTANT_CONFIGURATION_VERSION,
+} from './assistant-providers.js';
+
 import type {
   HealthJobQueue,
   HealthSystem,
@@ -424,6 +437,31 @@ const schemaSql = `
     record jsonb NOT NULL
   );
   ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS sequence bigserial;
+
+  CREATE TABLE IF NOT EXISTS assistant_interactions (
+    id uuid PRIMARY KEY,
+    sequence bigserial,
+    incident_id uuid NOT NULL REFERENCES incidents(id),
+    record jsonb NOT NULL,
+    provider_output jsonb
+  );
+  ALTER TABLE assistant_interactions ADD COLUMN IF NOT EXISTS sequence bigserial;
+  ALTER TABLE assistant_interactions ADD COLUMN IF NOT EXISTS provider_output jsonb;
+  CREATE INDEX IF NOT EXISTS assistant_interactions_incident ON assistant_interactions (incident_id);
+  CREATE TABLE IF NOT EXISTS published_updates (
+    id uuid PRIMARY KEY,
+    incident_id uuid NOT NULL REFERENCES incidents(id),
+    assistant_interaction_id uuid NOT NULL UNIQUE REFERENCES assistant_interactions(id),
+    record jsonb NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS assistant_daily_quota (
+    day date PRIMARY KEY,
+    used integer NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS assistant_minute_quota (
+    minute timestamptz PRIMARY KEY,
+    used integer NOT NULL
+  );
 
   ALTER TABLE evaluations
     DROP CONSTRAINT IF EXISTS evaluations_triage_case_id_key;
@@ -1683,6 +1721,8 @@ export class PostgresTriageSystem implements TriageSystem {
       actionResult,
       timelineResult,
       evidenceResult,
+      assistantResult,
+      publishedResult,
     ] = await Promise.all([
       this.pool.query<SignalRow>('SELECT * FROM signals WHERE id = $1', [
         triageRow.signal_id,
@@ -1725,6 +1765,14 @@ export class PostgresTriageSystem implements TriageSystem {
          ORDER BY l.record->>'createdAt', l.id`,
         [id],
       ),
+      this.pool.query<{ record: unknown }>(
+        `SELECT record FROM assistant_interactions WHERE incident_id = $1 ORDER BY sequence`,
+        [id],
+      ),
+      this.pool.query<{ record: unknown }>(
+        `SELECT record FROM published_updates WHERE incident_id = $1 ORDER BY (record->>'publishedAt'), id`,
+        [id],
+      ),
     ]);
 
     return IncidentDetailSchema.parse({
@@ -1745,6 +1793,8 @@ export class PostgresTriageSystem implements TriageSystem {
         signal: mapSignal(row),
         evaluation: row.evaluation,
       })),
+      assistantInteractions: assistantResult.rows.map((row) => row.record),
+      publishedUpdates: publishedResult.rows.map((row) => row.record),
     });
   }
 }

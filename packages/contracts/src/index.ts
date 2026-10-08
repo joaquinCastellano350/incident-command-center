@@ -824,9 +824,140 @@ export const IncidentDetailSchema = z.object({
   workflowActions: z.array(WorkflowActionSchema),
   timelineEvents: z.array(TimelineEventSchema),
   evidenceLinks: z.array(IncidentEvidenceSchema).default([]),
+  assistantInteractions: z
+    .array(z.lazy(() => AssistantInteractionSchema))
+    .default([]),
+  publishedUpdates: z.array(z.lazy(() => PublishedUpdateSchema)).default([]),
 });
 
 export type IncidentDetail = z.infer<typeof IncidentDetailSchema>;
+
+export const AssistantKindSchema = z.enum([
+  'summary',
+  'question',
+  'hypotheses',
+  'status_draft',
+]);
+export const AssistantCommandSchema = z
+  .object({
+    actor: z.literal('demo-operator'),
+    kind: AssistantKindSchema,
+    question: z.string().trim().min(1).max(1000).optional(),
+  })
+  .refine((value) => value.kind !== 'question' || !!value.question, {
+    message: 'A question is required',
+  });
+export type AssistantCommand = z.infer<typeof AssistantCommandSchema>;
+
+export const AssistantCitationSchema = z.object({
+  type: z.enum(['signal', 'timeline_event']),
+  id: z.uuid(),
+});
+export const AssistantOutputSchema = z.object({
+  claims: z.array(
+    z.object({
+      text: z.string().trim().min(1),
+      citations: z.array(AssistantCitationSchema).min(1),
+    }),
+  ),
+  hypotheses: z.array(z.string().trim().min(1)),
+  draft: z
+    .object({
+      text: z.string().trim().min(1),
+      citations: z.array(AssistantCitationSchema).min(1),
+    })
+    .nullable(),
+});
+export type AssistantOutput = z.infer<typeof AssistantOutputSchema>;
+
+export const AssistantEvidenceSchema = z.object({
+  signals: z.array(
+    z.object({
+      id: z.uuid(),
+      sourceType: z.enum([
+        'monitoring_alert',
+        'deployment_event',
+        'customer_report',
+        'log_anomaly',
+      ]),
+      occurredAt: z.iso.datetime(),
+      service: z.string(),
+      region: z.string().nullable(),
+      title: z.string().nullable(),
+      content: z.string().nullable(),
+      facts: z.record(z.string(), z.unknown()),
+    }),
+  ),
+  judgments: z.array(
+    z.object({
+      signalId: z.uuid(),
+      evaluationId: z.uuid(),
+      priorityAssessment: z.enum(['P0', 'P1', 'P2', 'P3']).nullable(),
+      evidenceSufficiencyYesProbability: z.number().min(0).max(1).nullable(),
+    }),
+  ),
+  policyDecisions: z.array(
+    z.object({
+      signalId: z.uuid(),
+      policyDecisionId: z.uuid(),
+      authorizedActions: z.array(WorkflowActionTypeSchema),
+      rules: z.array(PolicyRuleResultSchema),
+    }),
+  ),
+  timelineEvents: z.array(
+    z.object({
+      id: z.uuid(),
+      type: z.string(),
+      occurredAt: z.iso.datetime(),
+      summary: z.string(),
+    }),
+  ),
+});
+export type AssistantEvidence = z.infer<typeof AssistantEvidenceSchema>;
+
+export const AssistantEvidenceReferenceSchema = z.object({
+  type: z.enum(['signal', 'evaluation', 'policy_decision', 'timeline_event']),
+  id: z.uuid(),
+});
+
+export const AssistantInteractionSchema = z.object({
+  id: z.uuid(),
+  incidentId: z.uuid(),
+  actor: z.string().min(1),
+  kind: AssistantKindSchema,
+  question: z.string().nullable(),
+  mode: z.enum(['live', 'recorded']),
+  configurationVersion: z.string().min(1),
+  configuredModel: z.string().min(1),
+  returnedModel: z.string().nullable(),
+  providerRequestId: z.string().nullable(),
+  providerRequest: z.record(z.string(), z.unknown()),
+  inputEvidenceReferences: z.array(AssistantEvidenceReferenceSchema),
+  output: AssistantOutputSchema.nullable(),
+  latencyMs: z.number().nonnegative(),
+  outcome: z.enum([
+    'accepted',
+    'invalid_citation',
+    'invalid_response',
+    'provider_error',
+  ]),
+  createdAt: z.iso.datetime(),
+});
+export type AssistantInteraction = z.infer<typeof AssistantInteractionSchema>;
+
+export const PublishedUpdateSchema = z.object({
+  id: z.uuid(),
+  incidentId: z.uuid(),
+  assistantInteractionId: z.uuid(),
+  actor: z.literal('demo-operator'),
+  content: z.string().min(1),
+  publishedAt: z.iso.datetime(),
+});
+export type PublishedUpdate = z.infer<typeof PublishedUpdateSchema>;
+export const PublishUpdateCommandSchema = z.object({
+  actor: z.literal('demo-operator'),
+});
+export type PublishUpdateCommand = z.infer<typeof PublishUpdateCommandSchema>;
 
 export const PageRequestSchema = z.object({
   incidentId: z.uuid(),

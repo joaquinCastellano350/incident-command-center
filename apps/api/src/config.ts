@@ -7,6 +7,12 @@ const ApiConfigSchema = z.object({
   WEB_ORIGIN: z.url().default('http://localhost:3000'),
   OPERATOR_KEY: z.string().min(1).optional(),
   PUBLIC_DEMO_READ_ONLY: z.enum(['true', 'false']).default('false'),
+  ASSISTANT_MODE: z.enum(['live', 'recorded']).default('recorded'),
+  ASSISTANT_MODEL: z
+    .string()
+    .regex(/^gpt-5\.6-terra(?:-|$)/)
+    .default('gpt-5.6-terra'),
+  OPENAI_API_KEY: z.string().min(1).optional(),
 });
 
 export type ApiConfig = z.infer<typeof ApiConfigSchema>;
