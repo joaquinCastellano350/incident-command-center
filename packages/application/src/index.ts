@@ -3,6 +3,7 @@ import type {
   HealthCheckMessageV1,
   HealthStatus,
   IncidentDetail,
+  IncidentLifecycleCommand,
   DeploymentEventIngestionResult,
   DeploymentEventInput,
   CustomerReportIngestionResult,
@@ -66,6 +67,11 @@ export interface TriageSystem {
   listTriageCases(): Promise<TriageCase[]>;
   findTriageCase(id: string): Promise<TriageCaseDetail | null>;
   findIncident(id: string): Promise<IncidentDetail | null>;
+  transitionIncident(
+    id: string,
+    command: IncidentLifecycleCommand,
+    correlationId: string,
+  ): Promise<IncidentDetail | null>;
   listReviewTasks(): Promise<ReviewQueue>;
   resolveReview(
     id: string,

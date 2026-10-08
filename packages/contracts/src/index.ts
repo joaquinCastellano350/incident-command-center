@@ -421,6 +421,10 @@ export const EvaluationSchema = z
       'northstar-automation.v1',
       'northstar-automation.v2',
     ]),
+    candidateRetrievalVersion: z
+      .literal('northstar-incident-match.v1')
+      .nullable()
+      .default(null),
     request: z
       .object({
         input: EvaluationInputSchema,
@@ -734,6 +738,15 @@ export const IncidentSchema = z
 
 export type Incident = z.infer<typeof IncidentSchema>;
 
+export const IncidentLifecycleCommandSchema = z.object({
+  actor: z.literal('demo-operator'),
+  reason: z.string().trim().min(1),
+  status: IncidentSchema.shape.status,
+});
+export type IncidentLifecycleCommand = z.infer<
+  typeof IncidentLifecycleCommandSchema
+>;
+
 export const EvidenceLinkSchema = z.object({
   id: z.uuid(),
   incidentId: z.uuid(),
@@ -752,18 +765,30 @@ export const IncidentEvidenceSchema = z.object({
   evaluation: EvaluationSchema,
 });
 
-export const TimelineEventSchema = z.object({
+const TimelineEventBaseSchema = z.object({
   id: z.uuid(),
   correlationId: z.uuid(),
-  type: z.enum([
-    'incident_created',
-    'owner_assigned',
-    'on_call_paged',
-    'evidence_linked',
-  ]),
   occurredAt: z.iso.datetime(),
   summary: z.string(),
 });
+
+export const TimelineEventSchema = z.discriminatedUnion('type', [
+  TimelineEventBaseSchema.extend({
+    type: z.enum([
+      'incident_created',
+      'owner_assigned',
+      'on_call_paged',
+      'evidence_linked',
+    ]),
+  }),
+  TimelineEventBaseSchema.extend({
+    type: z.literal('lifecycle_transition'),
+    actor: z.string().min(1),
+    reason: z.string().min(1),
+    previousStatus: IncidentSchema.shape.status,
+    nextStatus: IncidentSchema.shape.status,
+  }),
+]);
 
 export type TimelineEvent = z.infer<typeof TimelineEventSchema>;
 
@@ -789,6 +814,7 @@ export type TriageCaseDetail = z.infer<typeof TriageCaseDetailSchema>;
 
 export const IncidentDetailSchema = z.object({
   incident: IncidentSchema,
+  nextLifecycleStatus: IncidentSchema.shape.status,
   signal: SignalSchema,
   evaluation: EvaluationSchema,
   reviewTask: ReviewTaskSchema.nullable(),

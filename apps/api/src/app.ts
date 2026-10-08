@@ -13,6 +13,7 @@ import {
   CustomerReportInputSchema,
   CustomerReportIngestionResultSchema,
   IncidentDetailSchema,
+  IncidentLifecycleCommandSchema,
   MonitoringAlertInputSchema,
   MonitoringAlertIngestionResultSchema,
   LogAnomalyIngestionResultSchema,
@@ -256,6 +257,31 @@ export async function buildApi({
         return reply.send(IncidentDetailSchema.parse(detail));
       },
     );
+
+    app.post('/api/v1/incidents/:id/lifecycle', async (request, reply) => {
+      if (!hasOperatorAccess(request.headers['x-operator-key'])) {
+        return reply.code(403).send({ error: 'Operator access required' });
+      }
+      const parameters = JobParametersSchema.safeParse(request.params);
+      const command = IncidentLifecycleCommandSchema.safeParse(request.body);
+      if (!parameters.success || !command.success) {
+        return reply.code(400).send({ error: 'Invalid Incident transition' });
+      }
+      try {
+        const detail = await triageSystem.transitionIncident(
+          parameters.data.id,
+          command.data,
+          z.uuid().parse(request.id),
+        );
+        if (!detail)
+          return reply.code(404).send({ error: 'Incident not found' });
+        return reply.send(IncidentDetailSchema.parse(detail));
+      } catch (error) {
+        if (error instanceof ReviewConflictError)
+          return reply.code(409).send({ error: error.message });
+        throw error;
+      }
+    });
 
     app.get('/api/v1/triage-cases/:id', async (request, reply) => {
       const parameters = JobParametersSchema.safeParse(request.params);

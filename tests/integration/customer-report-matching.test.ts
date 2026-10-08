@@ -611,17 +611,70 @@ describeWithPostgres('Customer Reports at the ingestion-to-query seam', () => {
         url: `/api/v1/triage-cases/${alertCaseId}`,
       })
     ).json().incidentId as string;
-    const pool = new Pool({ connectionString: isolatedUrl.toString() });
-    try {
-      await pool.query(
-        `UPDATE incidents SET record = jsonb_set(
-           jsonb_set(record, '{status}', '"resolved"'::jsonb),
-           '{resolvedAt}', to_jsonb($2::text)) WHERE id = $1`,
-        [incidentId, clock.now().toISOString()],
-      );
-    } finally {
-      await pool.end();
+    const initial = (
+      await api.inject({
+        method: 'GET',
+        url: `/api/v1/incidents/${incidentId}`,
+      })
+    ).json();
+    const lifecycleUrl = `/api/v1/incidents/${incidentId}/lifecycle`;
+    const headers = { 'x-operator-key': 'test-operator-key' };
+    const transition = (status: string, reason: string) =>
+      api.inject({
+        method: 'POST',
+        url: lifecycleUrl,
+        headers,
+        payload: { actor: 'demo-operator', status, reason },
+      });
+    expect((await transition('resolved', 'Invalid shortcut')).statusCode).toBe(
+      409,
+    );
+    expect(
+      (
+        await api.inject({
+          method: 'GET',
+          url: `/api/v1/incidents/${incidentId}`,
+        })
+      ).json().timelineEvents,
+    ).toEqual(initial.timelineEvents);
+    for (const [status, reason] of [
+      ['acknowledged', 'Investigating'],
+      ['mitigated', 'Failure rate returned to baseline'],
+      ['resolved', 'Monitoring confirmed recovery'],
+    ]) {
+      const response = await transition(status!, reason!);
+      expect(response.statusCode).toBe(200);
+      expect(response.json().incident.status).toBe(status);
     }
+    const resolvedBeforeEvidence = (
+      await api.inject({
+        method: 'GET',
+        url: `/api/v1/incidents/${incidentId}`,
+      })
+    ).json();
+    expect(resolvedBeforeEvidence.incident.resolvedAt).toBe(
+      clock.now().toISOString(),
+    );
+    expect(resolvedBeforeEvidence.timelineEvents.slice(-3)).toMatchObject([
+      {
+        previousStatus: 'open',
+        nextStatus: 'acknowledged',
+        actor: 'demo-operator',
+        reason: 'Investigating',
+      },
+      {
+        previousStatus: 'acknowledged',
+        nextStatus: 'mitigated',
+        actor: 'demo-operator',
+        reason: 'Failure rate returned to baseline',
+      },
+      {
+        previousStatus: 'mitigated',
+        nextStatus: 'resolved',
+        actor: 'demo-operator',
+        reason: 'Monitoring confirmed recovery',
+      },
+    ]);
     const report = await api.inject({
       method: 'POST',
       url: '/api/v1/signals/customer-reports',
@@ -698,6 +751,83 @@ describeWithPostgres('Customer Reports at the ingestion-to-query seam', () => {
         })
       ).json().incident.status,
     ).toBe('resolved');
+    const originalTime = clock.now().toISOString();
+    clock.set(new Date(Date.parse(originalTime) + 24 * 60 * 60 * 1000 + 1));
+    try {
+      const outsideLookback = await api.inject({
+        method: 'POST',
+        url: '/api/v1/signals/customer-reports',
+        payload: {
+          provider: 'northstar-support',
+          sourceEventKey: randomUUID(),
+          sourceReference: 'outside-resolved-lookback',
+          subject: `Later evidence for ${incidentId}`,
+          message: 'Checkout payment failed again',
+          customerReference: 'cust-resolved',
+          affectedOperation: 'payment_authorization',
+          service: 'checkout-api',
+          region: 'us-east',
+          reportedAt: originalTime,
+        },
+      });
+      const laterCaseId = outsideLookback.json().triageCase.id as string;
+      await expect
+        .poll(
+          async () =>
+            (
+              await api.inject({
+                method: 'GET',
+                url: `/api/v1/triage-cases/${laterCaseId}`,
+              })
+            ).json().evaluation?.id,
+          { timeout: 15_000 },
+        )
+        .toBeTruthy();
+      const laterCase = (
+        await api.inject({
+          method: 'GET',
+          url: `/api/v1/triage-cases/${laterCaseId}`,
+        })
+      ).json();
+      expect(laterCase.evaluation.candidateRetrievalVersion).toBe(
+        'northstar-incident-match.v1',
+      );
+      expect(
+        laterCase.evaluation.incidentMatches.map(
+          (match: { candidateIncidentId: string }) => match.candidateIncidentId,
+        ),
+      ).not.toContain(incidentId);
+    } finally {
+      clock.set(originalTime);
+    }
+    expect(
+      (
+        await api.inject({
+          method: 'POST',
+          url: lifecycleUrl,
+          payload: {
+            actor: 'demo-operator',
+            status: 'open',
+            reason: 'Unauthorized reopening',
+          },
+        })
+      ).statusCode,
+    ).toBe(403);
+    const reopening = await transition(
+      'open',
+      'New impact confirmed by Operator',
+    );
+    expect(reopening.statusCode).toBe(200);
+    expect(reopening.json().incident).toMatchObject({
+      status: 'open',
+      resolvedAt: null,
+    });
+    expect(reopening.json().timelineEvents.at(-1)).toMatchObject({
+      previousStatus: 'resolved',
+      nextStatus: 'open',
+      actor: 'demo-operator',
+      reason: 'New impact confirmed by Operator',
+    });
   });
 
   it('attaches one Evidence Link when two workers receive the same Signal', async () => {

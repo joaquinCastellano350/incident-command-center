@@ -642,6 +642,12 @@ export function DecisionTrace({
                   <p className="mt-2 text-sm text-muted-foreground">
                     {event.summary}
                   </p>
+                  {event.type === 'lifecycle_transition' && (
+                    <p className="mt-2 text-sm">
+                      {event.previousStatus} → {event.nextStatus} ·{' '}
+                      {event.actor} · {event.reason}
+                    </p>
+                  )}
                 </div>
               ))
             )}

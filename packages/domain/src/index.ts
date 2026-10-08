@@ -15,6 +15,41 @@ export interface Clock {
   now(): Date;
 }
 
+export const INCIDENT_MATCH_POLICY = {
+  version: 'northstar-incident-match.v1',
+  resolvedLookbackMs: 24 * 60 * 60 * 1000,
+} as const;
+
+const lifecycleSuccessor: Record<Incident['status'], Incident['status']> = {
+  open: 'acknowledged',
+  acknowledged: 'mitigated',
+  mitigated: 'resolved',
+  resolved: 'open',
+};
+
+export function nextIncidentLifecycleStatus(
+  status: Incident['status'],
+): Incident['status'] {
+  return lifecycleSuccessor[status];
+}
+
+export function transitionIncidentLifecycle(
+  incident: Incident,
+  nextStatus: Incident['status'],
+  occurredAt: string,
+): Incident {
+  if (nextIncidentLifecycleStatus(incident.status) !== nextStatus) {
+    throw new Error(
+      `Invalid Incident transition: ${incident.status} to ${nextStatus}`,
+    );
+  }
+  return {
+    ...incident,
+    status: nextStatus,
+    resolvedAt: nextStatus === 'resolved' ? occurredAt : null,
+  };
+}
+
 export class SystemClock implements Clock {
   now(): Date {
     return new Date();

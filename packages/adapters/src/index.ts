@@ -51,6 +51,7 @@ import {
   type EvaluationInput,
   type Incident,
   type IncidentDetail,
+  type IncidentLifecycleCommand,
   type MonitoringAlertIngestionResult,
   type MonitoringAlertInput,
   type LogAnomalyIngestionResult,
@@ -83,6 +84,9 @@ import {
   evaluateLogAnomalyDeterministically,
   NORTHSTAR_SERVICE_DOMAINS,
   reviewUrgency,
+  transitionIncidentLifecycle,
+  nextIncidentLifecycleStatus,
+  INCIDENT_MATCH_POLICY,
   WorkflowProviderError,
   type AssignmentProviderPort,
   type Clock,
@@ -419,6 +423,7 @@ const schemaSql = `
     incident_id uuid NOT NULL REFERENCES incidents(id),
     record jsonb NOT NULL
   );
+  ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS sequence bigserial;
 
   ALTER TABLE evaluations
     DROP CONSTRAINT IF EXISTS evaluations_triage_case_id_key;
@@ -1422,6 +1427,65 @@ export class PostgresTriageSystem implements TriageSystem {
     return this.findTriageCase(id);
   }
 
+  async transitionIncident(
+    id: string,
+    command: IncidentLifecycleCommand,
+    correlationId: string,
+  ): Promise<IncidentDetail | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<{ record: unknown }>(
+        'SELECT record FROM incidents WHERE id = $1 FOR UPDATE',
+        [id],
+      );
+      if (!result.rows[0]) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const incident = IncidentSchema.parse(result.rows[0].record);
+      const occurredAt = this.clock.now().toISOString();
+      let updated: Incident;
+      try {
+        updated = transitionIncidentLifecycle(
+          incident,
+          command.status,
+          occurredAt,
+        );
+      } catch {
+        throw new ReviewConflictError(
+          `Invalid Incident transition: ${incident.status} to ${command.status}`,
+        );
+      }
+      const event = TimelineEventSchema.parse({
+        id: randomUUID(),
+        correlationId,
+        type: 'lifecycle_transition',
+        occurredAt,
+        summary: `Operator ${command.actor} changed the Incident from ${incident.status} to ${command.status}.`,
+        actor: command.actor,
+        reason: command.reason,
+        previousStatus: incident.status,
+        nextStatus: updated.status,
+      });
+      await client.query(
+        'UPDATE incidents SET record = $2::jsonb WHERE id = $1',
+        [id, JSON.stringify(updated)],
+      );
+      await client.query(
+        'INSERT INTO timeline_events (id, incident_id, record) VALUES ($1, $2, $3::jsonb)',
+        [event.id, id, JSON.stringify(event)],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.findIncident(id);
+  }
+
   async overridePriority(
     id: string,
     command: PriorityOverrideCommand,
@@ -1552,8 +1616,7 @@ export class PostgresTriageSystem implements TriageSystem {
            WHERE incident_id = COALESCE(
              (SELECT id FROM incidents WHERE triage_case_id = $1),
              (SELECT incident_id FROM evidence_links WHERE triage_case_id = $1))
-           ORDER BY CASE record->>'type'
-             WHEN 'incident_created' THEN 1 WHEN 'owner_assigned' THEN 2 ELSE 3 END`,
+           ORDER BY sequence`,
         [id],
       ),
     ]);
@@ -1650,8 +1713,7 @@ export class PostgresTriageSystem implements TriageSystem {
       loadWorkflowActions(this.pool, 'incident_id', id),
       this.pool.query<{ record: unknown }>(
         `SELECT record FROM timeline_events WHERE incident_id = $1
-           ORDER BY CASE record->>'type'
-             WHEN 'incident_created' THEN 1 WHEN 'owner_assigned' THEN 2 ELSE 3 END`,
+           ORDER BY sequence`,
         [id],
       ),
       this.pool.query<SignalRow & { link: unknown; evaluation: unknown }>(
@@ -1667,6 +1729,9 @@ export class PostgresTriageSystem implements TriageSystem {
 
     return IncidentDetailSchema.parse({
       incident: incidentRow.record,
+      nextLifecycleStatus: nextIncidentLifecycleStatus(
+        IncidentSchema.parse(incidentRow.record).status,
+      ),
       signal: mapSignal(signalResult.rows[0]!),
       evaluation: evaluationResult.rows[0]!.record,
       reviewTask: reviewResult.rows[0]?.record ?? null,
@@ -1943,36 +2008,38 @@ export class PgBossTriageWorker {
        JOIN triage_cases t ON t.id = i.triage_case_id
        JOIN signals s ON s.id = t.signal_id
        WHERE i.record->>'status' <> 'resolved'
-          OR (i.record->>'resolvedAt')::timestamptz >= $3::timestamptz - interval '24 hours'
+          OR (i.record->>'resolvedAt')::timestamptz >= $7::timestamptz
        ORDER BY
-         (CASE WHEN position(i.id::text in $4) > 0 THEN 100 ELSE 0 END
-          + CASE WHEN position(s.source_reference in $4) > 0 THEN 60 ELSE 0 END
-          + CASE WHEN $6::text IS NOT NULL AND EXISTS (
+         (CASE WHEN position(i.id::text in $3) > 0 THEN 100 ELSE 0 END
+          + CASE WHEN position(s.source_reference in $3) > 0 THEN 60 ELSE 0 END
+          + CASE WHEN $5::text IS NOT NULL AND EXISTS (
               SELECT 1 FROM evidence_links el
               JOIN signals linked ON linked.id = el.signal_id
               WHERE el.incident_id = i.id
-                AND linked.facts->>'customerReference' = $6
+                AND linked.facts->>'customerReference' = $5
             ) THEN 60 ELSE 0 END
           + CASE WHEN s.service = $1 THEN 20 ELSE 0 END
           + CASE WHEN s.region = $2 THEN 10 ELSE 0 END
-          + CASE WHEN i.record->>'primaryOwningDomain' = $5 THEN 8 ELSE 0 END
-          + CASE WHEN s.facts->>'affectedOperation' = $7 THEN 8 ELSE 0 END
+          + CASE WHEN i.record->>'primaryOwningDomain' = $4 THEN 8 ELSE 0 END
+          + CASE WHEN s.facts->>'affectedOperation' = $6 THEN 8 ELSE 0 END
           + 10 * ts_rank(to_tsvector('english',
                          coalesce(i.record->>'title', '') || ' ' ||
                          coalesce(s.title, '') || ' ' ||
                          coalesce(s.content, '') || ' ' || s.source_reference),
-                         websearch_to_tsquery('english', $4))
-          + 5 * similarity(coalesce(i.record->>'title', ''), $4)) DESC,
+                         websearch_to_tsquery('english', $3))
+          + 5 * similarity(coalesce(i.record->>'title', ''), $3)) DESC,
          (i.record->>'createdAt') DESC
        LIMIT 5`,
       [
         signal.service,
         signal.region,
-        occurredAt,
         searchText,
         knownDomain,
         customerReference,
         affectedOperation,
+        new Date(
+          this.clock.now().getTime() - INCIDENT_MATCH_POLICY.resolvedLookbackMs,
+        ).toISOString(),
       ],
     );
     const candidates = candidateResult.rows.map((row) => {
@@ -2056,6 +2123,7 @@ export class PgBossTriageWorker {
         decisionSchemaVersion: 'operational-judgments.v1',
         questionSetVersion,
         policyVersion,
+        candidateRetrievalVersion: INCIDENT_MATCH_POLICY.version,
         request: {
           input: evaluationRequest,
           provider: error.metadata.providerRequest,
@@ -2109,6 +2177,7 @@ export class PgBossTriageWorker {
       decisionSchemaVersion: 'operational-judgments.v1',
       questionSetVersion,
       policyVersion,
+      candidateRetrievalVersion: INCIDENT_MATCH_POLICY.version,
       request: {
         input: evaluationRequest,
         provider: judgmentResult.providerRequest ?? null,
@@ -2598,7 +2667,7 @@ export class PgBossTriageWorker {
     transaction: TransactionalDatabase,
     incidentId: string,
     correlationId: string,
-    type: TimelineEvent['type'],
+    type: Exclude<TimelineEvent['type'], 'lifecycle_transition'>,
     summary: string,
     occurredAt: string,
   ): Promise<void> {
